@@ -1,5 +1,6 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -187,10 +188,17 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
+  // EXPERIMENTAL: GUFO_DRAFT_PREFIX sets the draft head's leading rows and
+  // GUFO_DRAFT_HEAD_Q8=1 keeps that prefix in Q8_0 instead of the Q4_K copy
+  // (draft-head sweeps: acceptance against draft-step cost).
+  if (const char* v = std::getenv("GUFO_DRAFT_PREFIX"); v != nullptr && std::atoi(v) > 0)
+    m->draft_prefix_ = static_cast<std::uint32_t>(std::atoi(v));
+  const char* q8_head = std::getenv("GUFO_DRAFT_HEAD_Q8");
+  const bool keep_q8 = q8_head != nullptr && q8_head[0] == '1';
   if (m->mtp_weights_ &&
-      m->device_->output().rows > speculative::kDraftVocabPrefix) {
+      m->device_->output().rows > m->draft_prefix_) {
     std::vector<std::int32_t> specials;
-    for (std::uint32_t id = speculative::kDraftVocabPrefix;
+    for (std::uint32_t id = m->draft_prefix_;
          id < m->device_->output().rows; ++id)
       if (m->tokenizer_->IsSpecialToken(id))
         specials.push_back(static_cast<std::int32_t>(id));
@@ -198,8 +206,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     // full head.
     if (specials.size() < speculative::kDraftVocabExtraRows) {
       m->draft_specials_ = static_cast<std::uint32_t>(specials.size());
-      if (!m->device_->SetDraftVocab(speculative::kDraftVocabPrefix,
-                                     std::move(specials), error_msg))
+      if (!m->device_->SetDraftVocab(m->draft_prefix_, std::move(specials), error_msg,
+                                     keep_q8))
         return nullptr;
       m->draft_subset_ = true;
     }
@@ -342,7 +350,7 @@ std::size_t Model::ExpandedQ8_0Tensors() const noexcept {
 
 bool Model::InDraftSubset(std::int32_t token) const {
   return token >= 0 &&
-         (static_cast<std::uint32_t>(token) < speculative::kDraftVocabPrefix ||
+         (static_cast<std::uint32_t>(token) < draft_prefix_ ||
           tokenizer_->IsSpecialToken(
               static_cast<tokenization::TokenId>(token)));
 }

@@ -526,7 +526,7 @@ DeviceModel::~DeviceModel() {
 
 bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
                                 std::vector<std::int32_t> specials,
-                                std::string* error_msg) {
+                                std::string* error_msg, bool keep_q8) {
   const auto fail = [&](const std::string& message) {
     if (error_msg != nullptr)
       *error_msg = message;
@@ -546,7 +546,7 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
   }
   draft_output_ = src;
   draft_output_.rows = prefix_rows;
-  if (src.type == core::GgmlType::kQ8_0 && src.cols % 256 == 0) {
+  if (!keep_q8 && src.type == core::GgmlType::kQ8_0 && src.cols % 256 == 0) {
     // Drafts read a Q4_K copy of the Q8_0 prefix: the head is the larger
     // part of each draft step's weight traffic, and its proposals are
     // verified, so this changes acceptance only. Each row of the copy is

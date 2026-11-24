@@ -150,9 +150,10 @@ public:
   /// only steer speculation: the target still verifies every token, so greedy
   /// text is unchanged. Sampled text can differ: a smaller head changes
   /// acceptance, and so the later random draws.
+  /// keep_q8: read a Q8_0 prefix as it is instead of a Q4_K copy.
   [[nodiscard]] bool SetDraftVocab(std::uint32_t prefix_rows,
                                    std::vector<std::int32_t> specials,
-                                   std::string* error_msg);
+                                   std::string* error_msg, bool keep_q8 = false);
   const DeviceMixer& hc_head() const noexcept { return hc_head_; }
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }

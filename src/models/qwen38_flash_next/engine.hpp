@@ -165,6 +165,9 @@ private:
   bool draft_subset_{false};
   /// Special tokens at the start of every session's draft table.
   std::uint32_t draft_specials_{0};
+  /// Leading output rows the MTP draft head reads (speculative::
+  /// kDraftVocabPrefix unless GUFO_DRAFT_PREFIX sets it, for sweeps).
+  std::uint32_t draft_prefix_{speculative::kDraftVocabPrefix};
   /// Prefix and special tokens: always in the small head.
   [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
 
