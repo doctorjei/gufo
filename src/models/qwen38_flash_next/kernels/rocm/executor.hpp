@@ -666,6 +666,13 @@ private:
              std::string* error_msg) const;
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
+  /// Wide prefill pass for a kHT4 or kQ6G64 matrix (hgn_prefill.hpp): the
+  /// matrix decoded once to f16 in wide_w16_, then one f16 GEMM over all
+  /// n_tokens rows; ht's rotations act on the activations. False with no
+  /// error when the matrix does not fit the scratch (callers fall back).
+  bool WideHgn(const DeviceTensor& w, std::uint32_t n_tokens) const noexcept;
+  bool WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
+                   std::uint32_t n_tokens, std::string* error_msg) const;
   /// y = W x for a kHT4 matrix read in place (ht_dense.hpp), in launches of
   /// up to eight token rows.
   bool HtDense(const DeviceTensor& w, const float* x, float* out,
@@ -1073,11 +1080,23 @@ private:
   unsigned* rot_counters_up_{nullptr};
   unsigned* rot_counters_down_{nullptr};
   unsigned* rot_counters_shared_{nullptr};
+  /// Prefill grouping of the rotated experts' slots by expert
+  /// (i4r_group_slots): offsets [experts + 1], cursor [experts], slots
+  /// [max_batch x used], and the grouped gate+up's arrival counters
+  /// [experts x expert_ff / 128] (zero in and out).
+  std::int32_t* rot_group_offsets_{nullptr};
+  std::int32_t* rot_group_cursor_{nullptr};
+  std::int32_t* rot_group_slots_{nullptr};
+  unsigned* rot_group_counters_{nullptr};
   /// ht kernel scratch: cross-workgroup partial sums and per-band arrival
   /// counters (zeroed; each finishing workgroup resets its counter).
   float* ht_partials_{nullptr};
   unsigned* ht_counters_{nullptr};
   std::size_t ht_partial_floats_{0};
+  /// f16 copy of one kHT4 / kQ6G64 matrix for wide prefill GEMMs, sized for
+  /// the largest such matrix except the output head (null: no wide path).
+  void* wide_w16_{nullptr};
+  std::size_t wide_w16_elems_{0};
   std::size_t ht_counter_count_{0};
   std::uint32_t rot_counter_tokens_{0};
   /// Plain f16 input for the batched rotated kernels (GUFO_I4R_PLAIN_F16=1).

@@ -277,9 +277,20 @@ struct Batch {
   unsigned* cnt_down;
 };
 
+struct Group {
+  std::int32_t* offsets = nullptr;
+  std::int32_t* cursor = nullptr;
+  std::int32_t* slots = nullptr;
+  unsigned* counters = nullptr;
+};
+
 void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const float* x,
               const float* weights, float* out, int n_tokens, std::size_t n_experts,
-              hipStream_t st) {
+              hipStream_t st, const Group* grp = nullptr) {
+  if (grp != nullptr &&
+      !i4r_group_slots(ids, n_tokens * kUsed, static_cast<int>(n_experts), grp->offsets,
+                       grp->cursor, grp->slots, st))
+    std::exit(3);
   I4rGateUpArgs gu{};
   gu.gate = L.gate_new;
   gu.up = L.up_new;
@@ -297,6 +308,11 @@ void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const flo
   gu.ff = kFf;
   gu.used = kUsed;
   gu.n_tokens = n_tokens;
+  if (grp != nullptr) {
+    gu.group_offsets = grp->offsets;
+    gu.group_slots = grp->slots;
+    gu.group_counters = grp->counters;
+  }
   if (!i4r_fused_gate_up(&gu, n_tokens * kUsed, st)) std::exit(3);
   I4rDownArgs dn{};
   dn.down = L.down_new;
@@ -311,6 +327,10 @@ void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const flo
   dn.hidden = kHidden;
   dn.ff = kFf;
   dn.used = kUsed;
+  if (grp != nullptr) {
+    dn.group_offsets = grp->offsets;
+    dn.group_slots = grp->slots;
+  }
   if (!i4r_fused_down(&dn, n_tokens, st)) std::exit(3);
 }
 
@@ -599,6 +619,83 @@ int main(int argc, char** argv) {
     std::printf("TIME batch, per MoE layer: 1 token %.1f us; 8 tokens mostly distinct (%d experts) %.1f us; "
                 "8 tokens shared (%d experts) %.1f us\n",
                 t_batch_one, n_distinct, t_batch_distinct, n_shared, t_batch_shared);
+  }
+
+  // ---- Prefill chunks: slots grouped by expert ----
+  // 256 tokens with random experts (about 5 slots per expert at 512
+  // experts): grouped launches must equal per-token runs bit for bit, and
+  // are timed against the per-slot launches.
+  {
+    constexpr int kP = 256;
+    Batch b{};
+    b.x = falloc(kP * kHidden);
+    b.gate_e = falloc(kP * kUsed * kFf);
+    b.up_e = falloc(kP * kUsed * kFf);
+    b.down_e = falloc(kP * kUsed * kHidden);
+    b.weights = falloc(kP * kUsed);
+    b.out = falloc(kP * kHidden);
+    HIP_OK(hipMalloc(&b.cnt_up, kP * kUsed * (kFf / 128) * sizeof(unsigned)));
+    HIP_OK(hipMemset(b.cnt_up, 0, kP * kUsed * (kFf / 128) * sizeof(unsigned)));
+    HIP_OK(hipMalloc(&b.cnt_down, kP * (kHidden / 128) * sizeof(unsigned)));
+    HIP_OK(hipMemset(b.cnt_down, 0, kP * (kHidden / 128) * sizeof(unsigned)));
+    Group g;
+    HIP_OK(hipMalloc(&g.offsets, (n_exp + 1) * sizeof(std::int32_t)));
+    HIP_OK(hipMalloc(&g.cursor, n_exp * sizeof(std::int32_t)));
+    HIP_OK(hipMalloc(&g.slots, kP * kUsed * sizeof(std::int32_t)));
+    HIP_OK(hipMalloc(&g.counters, n_exp * (kFf / 128) * sizeof(unsigned)));
+    HIP_OK(hipMemset(g.counters, 0, n_exp * (kFf / 128) * sizeof(unsigned)));
+    float* ref = falloc(kP * kHidden);
+    std::vector<std::int32_t> ids(kP * kUsed), perm(n_exp);
+    for (std::size_t i = 0; i < n_exp; ++i) perm[i] = static_cast<std::int32_t>(i);
+    for (int t = 0; t < kP; ++t) {
+      std::shuffle(perm.begin(), perm.end(), rng);
+      for (int k = 0; k < kUsed; ++k) ids[t * kUsed + k] = perm[k];
+    }
+    std::int32_t* dids = nullptr;
+    HIP_OK(hipMalloc(&dids, ids.size() * sizeof(std::int32_t)));
+    HIP_OK(hipMemcpy(dids, ids.data(), ids.size() * sizeof(std::int32_t), hipMemcpyHostToDevice));
+    {
+      std::vector<float> x(kP * kHidden), w(kP * kUsed);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      for (auto& v : x) v = nd(rng);
+      for (auto& v : w) v = 0.05f + 0.1f * std::abs(nd(rng));
+      HIP_OK(hipMemcpy(b.x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice));
+      HIP_OK(hipMemcpy(b.weights, w.data(), w.size() * sizeof(float), hipMemcpyHostToDevice));
+    }
+    for (int t = 0; t < kP; ++t)
+      RunBatch(layers[0], b, dids + t * kUsed, b.x + t * kHidden, b.weights + t * kUsed,
+               ref + t * kHidden, 1, n_exp, st);
+    const auto r = Download(ref, kP * kHidden);
+    int mism = 0;
+    for (int rep = 0; rep < 2; ++rep) {  // twice: counters must reset themselves
+      RunBatch(layers[0], b, dids, b.x, b.weights, b.out, kP, n_exp, st, &g);
+      const auto got = Download(b.out, kP * kHidden);
+      for (std::size_t i = 0; i < r.size(); ++i)
+        mism += std::memcmp(&r[i], &got[i], sizeof(float)) != 0;
+    }
+    std::printf("prefill chunk of %d tokens, grouped by expert: %d of %zu outputs differ from per-token runs\n",
+                kP, mism, 2 * r.size());
+    if (mism != 0) {
+      std::printf("FAIL: grouped prefill is not bit-identical to per-token runs\n");
+      ++fails;
+    }
+    auto time_p = [&](const Group* grp) {
+      for (int i = 0; i < 4; ++i)
+        RunBatch(layers[i % n_layers], b, dids, b.x, b.weights, b.out, kP, n_exp, st, grp);
+      const int it = std::max(8, iters / 20);
+      HIP_OK(hipEventRecord(e0, st));
+      for (int i = 0; i < it; ++i)
+        RunBatch(layers[i % n_layers], b, dids, b.x, b.weights, b.out, kP, n_exp, st, grp);
+      HIP_OK(hipEventRecord(e1, st));
+      HIP_OK(hipEventSynchronize(e1));
+      float ms = 0;
+      HIP_OK(hipEventElapsedTime(&ms, e0, e1));
+      return 1000.0 * ms / it;
+    };
+    const double t_slot = time_p(nullptr);
+    const double t_group = time_p(&g);
+    std::printf("TIME prefill chunk %d tokens, per MoE layer: per-slot %.1f us (%.1f us/token); grouped %.1f us (%.1f us/token)\n",
+                kP, t_slot, t_slot / kP, t_group, t_group / kP);
   }
 
   // ---- Timing ----

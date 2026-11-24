@@ -51,6 +51,11 @@ struct I4rGateUpArgs {
   unsigned* shared_counters;  ///< [n_tokens x hidden/128], zero in and out
   int shared_ff;
   int n_tokens;
+  /// Optional prefill grouping (i4r_group_slots): when group_offsets is set,
+  /// the launch runs one set of workgroups per expert over its slots.
+  const std::int32_t* group_offsets;  ///< [n_experts + 1]
+  const std::int32_t* group_slots;    ///< [n_slots], slots ordered by expert
+  unsigned* group_counters;           ///< [n_experts x ff/128], zero in and out
 };
 
 struct I4rDownArgs {
@@ -73,6 +78,8 @@ struct I4rDownArgs {
   /// down_part (the [slots x hidden] layout of the unfused path).
   int per_slot_out;
   int plain_f16;  ///< as in I4rGateUpArgs
+  const std::int32_t* group_offsets;  ///< as in I4rGateUpArgs (same grouping)
+  const std::int32_t* group_slots;
 };
 
 /// Launches gate+up for n_slots = n_tokens * used slots. False when the
@@ -82,6 +89,12 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots,
 
 /// Launches down + combine for n_tokens tokens.
 bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream);
+
+/// Groups a batch's slots by expert: offsets[e]..offsets[e+1] index the
+/// slots of expert e in `slots`. cursor is [n_experts] scratch.
+bool i4r_group_slots(const std::int32_t* ids, int n_slots, int n_experts,
+                     std::int32_t* offsets, std::int32_t* cursor, std::int32_t* slots,
+                     hipStream_t stream);
 
 /// Repacks n_blocks Q8_0 blocks (34 bytes: f16 scale + 32 int8) into a codes
 /// region (32 bytes per block) then a scales region (f16 per block).
@@ -94,6 +107,13 @@ bool i4r_repack_split(const std::uint8_t* src, std::uint8_t* dst,
                       std::size_t n_blocks, hipStream_t stream);
 
 }  // extern "C"
+
+/// Batches that use the grouped (prefill) launches: wider than the verify
+/// batches the shared-expert kernels cover.
+[[nodiscard]] constexpr bool I4rGroupedBatch(std::uint32_t n_tokens,
+                                             std::uint32_t used) noexcept {
+  return n_tokens > 32 || n_tokens * used > 256;
+}
 
 /// Whether the fused kernels have an instantiation for this geometry.
 [[nodiscard]] constexpr bool I4rFusedSupports(std::uint32_t hidden,

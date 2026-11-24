@@ -29,6 +29,7 @@
 #include "src/core/quant/i4r_fused.hpp"
 #include "src/core/quant/ht_dense.hpp"
 #include "src/core/quant/q6g64_dense.hpp"
+#include "src/core/quant/hgn_prefill.hpp"
 #include "src/core/quant/i4r_launch.hpp"
 #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/gdn_geometry.hpp"
@@ -1162,6 +1163,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         e->rot_counters_shared_ == nullptr)
       return nullptr;
     e->rot_counter_tokens_ = static_cast<std::uint32_t>(T);
+    if (I4rGroupedBatch(static_cast<std::uint32_t>(T), c.num_experts_used)) {
+      e->rot_group_offsets_ = Alloc<std::int32_t>(a, c.num_experts + 1, error_msg);
+      e->rot_group_cursor_ = Alloc<std::int32_t>(a, c.num_experts, error_msg);
+      e->rot_group_slots_ = Alloc<std::int32_t>(a, slots, error_msg);
+      e->rot_group_counters_ =
+          Alloc<unsigned>(a, std::size_t{c.num_experts} * (c.expert_ff / 128), error_msg);
+      if (e->rot_group_offsets_ == nullptr || e->rot_group_cursor_ == nullptr ||
+          e->rot_group_slots_ == nullptr || e->rot_group_counters_ == nullptr)
+        return nullptr;
+    }
     // EXPERIMENTAL: GUFO_I4R_PLAIN_F16=1 stages the batched kernels' input
     // as plain f16 (the spec variant) instead of the f16 hi/lo split. Faster,
     // but ~4e-4 of peak against the f32 path, outside the 1e-4 parity gate.
@@ -1220,6 +1231,31 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         return nullptr;
       e->ht_partial_floats_ = partials;
       e->ht_counter_count_ = counters;
+    }
+    // Wide prefill: one f16 copy of the largest kHT4 / kQ6G64 matrix (the
+    // output head excluded: prefill only needs its last row, which takes the
+    // decode kernel).
+    if (T > kVecBatch) {
+      std::size_t elems = 0;
+      const auto note_w16 = [&](const DeviceTensor& t) {
+        if (t.empty() || (t.type != GgmlType::kHT4 && t.type != GgmlType::kQ6G64)) return;
+        elems = std::max<std::size_t>(elems, std::size_t{t.rows} * t.cols);
+      };
+      for (const auto& l : model.layers()) {
+        for (const DeviceTensor* t :
+             {&l.ssm_qkv, &l.ssm_gate, &l.ssm_out, &l.attn_q, &l.attn_k, &l.attn_v,
+              &l.attn_out, &l.indexer_q, &l.indexer_k, &l.shexp_gate, &l.shexp_up,
+              &l.shexp_down, &l.ple_key, &l.ple_value, &l.hc_attn.down, &l.hc_attn.up,
+              &l.hc_ffn.down, &l.hc_ffn.up})
+          note_w16(*t);
+      }
+      note_w16(model.hc_head().down);
+      note_w16(model.hc_head().up);
+      if (elems > 0) {
+        e->wide_w16_ = Alloc<std::uint16_t>(a, elems, error_msg);
+        if (e->wide_w16_ == nullptr) return nullptr;
+        e->wide_w16_elems_ = elems;
+      }
     }
   }
   // Keep score/selection traffic near the device cache size. Captured
@@ -2388,6 +2424,13 @@ bool Executor::HtDenseGroup(
       return false;
     }
   }
+  bool wide = WidePrefill(n_tokens);
+  for (const auto& [w, out] : parts) wide = wide && WideHgn(*w, n_tokens);
+  if (wide) {
+    for (const auto& [w, out] : parts)
+      if (!WideHgnGemm(*w, x, out, n_tokens, error_msg)) return false;
+    return true;
+  }
   for (std::uint32_t r = 0; r < n_tokens; r += 8) {
     const std::uint32_t n = std::min<std::uint32_t>(8, n_tokens - r);
     HtGroupArgs g{};
@@ -2413,6 +2456,51 @@ bool Executor::HtDenseGroup(
   return true;
 }
 
+bool Executor::WideHgn(const DeviceTensor& w, std::uint32_t n_tokens) const noexcept {
+  return wide_w16_ != nullptr && std::size_t{w.rows} * w.cols <= wide_w16_elems_ &&
+         w.cols <= model_->max_half_cols() && n_tokens <= scratch_rows_ &&
+         (w.type == GgmlType::kQ6G64 ||
+          (w.type == GgmlType::kHT4 && w.su != nullptr && w.sv != nullptr &&
+           w.rows % 128 == 0 && w.cols % 128 == 0));
+}
+
+bool Executor::WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
+                           std::uint32_t n_tokens, std::string* error_msg) const {
+  const int m = static_cast<int>(w.rows);
+  const int k = static_cast<int>(w.cols);
+  const int n = static_cast<int>(n_tokens);
+  const auto* data = static_cast<const std::uint8_t*>(w.data);
+  if (w.type == GgmlType::kHT4) {
+    // x_half now holds this matrix's rotated input, not the plain rows.
+    half_src_ = nullptr;
+    if (!ht_decode_f16(data, m, k, wide_w16_, stream_) ||
+        !ht_rotate_input_f16(x, w.su, s_.x_half, n, k, stream_)) {
+      AssignError(error_msg, "ht prefill decode or input rotation failed");
+      return false;
+    }
+  } else {
+    if (!q6g64_decode_f16(data, m, k, wide_w16_, stream_)) {
+      AssignError(error_msg, "q6g64 prefill decode failed");
+      return false;
+    }
+    if (!(half_src_ == x && half_rows_ == n_tokens && half_cols_ == w.cols &&
+          !half_bf16_)) {
+      NarrowActivations(x, s_.x_half, false, static_cast<std::size_t>(n) * k, stream_);
+      half_src_ = x;
+      half_rows_ = n_tokens;
+      half_cols_ = w.cols;
+      half_bf16_ = false;
+    }
+  }
+  if (!blaslt_->Gemm(wide_w16_, s_.x_half, out, HIP_R_16F, m, n, k, error_msg))
+    return false;
+  if (w.type == GgmlType::kHT4 && !ht_rotate_output(out, w.sv, n, m, stream_)) {
+    AssignError(error_msg, "ht prefill output rotation failed");
+    return false;
+  }
+  return true;
+}
+
 bool Executor::HtDense(const DeviceTensor& w, const float* x, float* out,
                        std::uint32_t n_tokens, std::string* error_msg) const {
   return HtDenseGroup({{&w, out}}, x, n_tokens, error_msg);
@@ -2424,6 +2512,8 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     return HtDense(w, x, out, n_tokens, error_msg);
   }
   if (w.type == GgmlType::kQ6G64) {
+    if (WidePrefill(n_tokens) && WideHgn(w, n_tokens))
+      return WideHgnGemm(w, x, out, n_tokens, error_msg);
     // Hyper-connection projections stored as q6g64, read in place
     // (q6g64_dense.hpp), up to eight token rows per launch.
     for (std::uint32_t r = 0; r < n_tokens; r += 8) {
@@ -3861,6 +3951,15 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       AssignError(error_msg, "rotated batch exceeds the arrival counter capacity");
       return false;
     }
+    // Prefill chunks: group the slots by expert so each expert's weights are
+    // read once per chunk (the per-token arithmetic is unchanged).
+    const bool grouped = I4rGroupedBatch(n_tokens, used) && rot_group_slots_ != nullptr;
+    if (grouped &&
+        !i4r_group_slots(s_.ids, static_cast<int>(slots), static_cast<int>(c.num_experts),
+                         rot_group_offsets_, rot_group_cursor_, rot_group_slots_, stream_)) {
+      AssignError(error_msg, "rotated expert grouping launch failed");
+      return false;
+    }
     I4rGateUpArgs gu{};
     gu.gate = static_cast<const std::uint8_t*>(l.ffn_gate_exps.data);
     gu.up = static_cast<const std::uint8_t*>(l.ffn_up_exps.data);
@@ -3879,6 +3978,11 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     gu.used = static_cast<int>(used);
     gu.n_tokens = static_cast<int>(n_tokens);
     gu.plain_f16 = rot_plain_f16_ ? 1 : 0;
+    if (grouped) {
+      gu.group_offsets = rot_group_offsets_;
+      gu.group_slots = rot_group_slots_;
+      gu.group_counters = rot_group_counters_;
+    }
     if (l.shexp_split) {
       if (l.shexp_down.cols / 128 > used) {
         AssignError(error_msg, "shared-expert slices exceed the partial scratch");
@@ -3916,6 +4020,10 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     dn.used = static_cast<int>(used);
     dn.per_slot_out = rot_per_slot_for_test_ ? 1 : 0;
     dn.plain_f16 = rot_plain_f16_ ? 1 : 0;
+    if (grouped) {
+      dn.group_offsets = rot_group_offsets_;
+      dn.group_slots = rot_group_slots_;
+    }
     if (!i4r_fused_down(&dn, static_cast<int>(n_tokens), stream_)) {
       AssignError(error_msg, "rotated down launch has no instantiation");
       return false;

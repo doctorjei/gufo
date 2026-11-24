@@ -450,7 +450,8 @@ if (ENGINE_ENABLE_HIP)
   set_source_files_properties(src/core/quant/i4r_kernels.hip.cpp
     src/core/quant/i4r_fused_kernels.hip.cpp
     src/core/quant/ht_dense_kernels.hip.cpp
-    src/core/quant/q6g64_dense_kernels.hip.cpp PROPERTIES
+    src/core/quant/q6g64_dense_kernels.hip.cpp
+    src/core/quant/hgn_prefill_kernels.hip.cpp PROPERTIES
     LANGUAGE HIP)
   target_sources(gufo_core PRIVATE
     src/core/hip/weight_upload.cpp
@@ -459,6 +460,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/quant/i4r_fused_kernels.hip.cpp
     src/core/quant/ht_dense_kernels.hip.cpp
     src/core/quant/q6g64_dense_kernels.hip.cpp
+    src/core/quant/hgn_prefill_kernels.hip.cpp
   )
   set_target_properties(gufo_core PROPERTIES
     HIP_STANDARD 20

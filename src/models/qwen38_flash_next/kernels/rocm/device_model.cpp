@@ -122,7 +122,9 @@ struct Uploader {
     d.cols = static_cast<std::uint32_t>(t.cols);
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = static_cast<std::uint32_t>(t.experts);
-    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16) {
+    // kHT4 / kQ6G64: wide prefill stages its f16 activations in x_half too.
+    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16 ||
+        t.type == core::GgmlType::kHT4 || t.type == core::GgmlType::kQ6G64) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
     if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {

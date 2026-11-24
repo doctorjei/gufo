@@ -10,10 +10,12 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "src/core/quant/hgn_decode.hpp"
 #include "src/core/quant/ht_dense.hpp"
+#include "src/core/quant/hgn_prefill.hpp"
 
 namespace {
 
@@ -200,6 +202,111 @@ double RunGroup(const std::vector<int>& rows, int cols, int n, std::mt19937& rng
   return worst;
 }
 
+// Wide prefill path (hgn_prefill.hpp): M decoded to f16 on the GPU, input
+// rotated to f16 on the GPU, y' = M x' on the host in double, output rotated
+// on the GPU; compared with the CPU-decoded weights times x.
+double RunWide(int rows, int cols, int n, std::mt19937& rng) {
+  const Mat m = MakeMat(rows, cols, rng);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> x(static_cast<std::size_t>(n) * cols);
+  for (auto& v : x) v = nd(rng);
+  auto* dcodes = Up(m.codes);
+  auto* dsu = Up(m.su);
+  auto* dsv = Up(m.sv);
+  auto* dx = Up(x);
+  _Float16* dm = nullptr;
+  _Float16* dxr = nullptr;
+  float* dy = nullptr;
+  HIP_OK(hipMalloc(&dm, static_cast<std::size_t>(rows) * cols * 2));
+  HIP_OK(hipMalloc(&dxr, static_cast<std::size_t>(n) * cols * 2));
+  HIP_OK(hipMalloc(&dy, static_cast<std::size_t>(n) * rows * 4));
+  if (!ht_decode_f16(dcodes, rows, cols, dm, nullptr) ||
+      !ht_rotate_input_f16(dx, dsu, dxr, n, cols, nullptr)) {
+    std::printf("wide launch refused\n");
+    std::exit(2);
+  }
+  HIP_OK(hipDeviceSynchronize());
+  std::vector<_Float16> hm(static_cast<std::size_t>(rows) * cols), hx(static_cast<std::size_t>(n) * cols);
+  HIP_OK(hipMemcpy(hm.data(), dm, hm.size() * 2, hipMemcpyDeviceToHost));
+  HIP_OK(hipMemcpy(hx.data(), dxr, hx.size() * 2, hipMemcpyDeviceToHost));
+  std::vector<float> yp(static_cast<std::size_t>(n) * rows);
+  for (int t = 0; t < n; ++t)
+    for (int r = 0; r < rows; ++r) {
+      double acc = 0.0;
+      for (int c = 0; c < cols; ++c)
+        acc += static_cast<double>(hm[static_cast<std::size_t>(r) * cols + c]) *
+               static_cast<double>(hx[static_cast<std::size_t>(t) * cols + c]);
+      yp[static_cast<std::size_t>(t) * rows + r] = static_cast<float>(acc);
+    }
+  HIP_OK(hipMemcpy(dy, yp.data(), yp.size() * 4, hipMemcpyHostToDevice));
+  if (!ht_rotate_output(dy, dsv, n, rows, nullptr)) {
+    std::printf("wide output rotation refused\n");
+    std::exit(2);
+  }
+  std::vector<float> y(yp.size());
+  HIP_OK(hipMemcpy(y.data(), dy, y.size() * 4, hipMemcpyDeviceToHost));
+  double worst = 0.0;
+  for (int t = 0; t < n; ++t) {
+    double peak = 0.0, emax = 0.0;
+    for (int r = 0; r < rows; ++r) {
+      double ref = 0.0;
+      for (int c = 0; c < cols; ++c)
+        ref += static_cast<double>(m.w[static_cast<std::size_t>(r) * cols + c]) *
+               x[static_cast<std::size_t>(t) * cols + c];
+      peak = std::max(peak, std::fabs(ref));
+      emax = std::max(emax, std::fabs(ref - y[static_cast<std::size_t>(t) * rows + r]));
+    }
+    worst = std::max(worst, emax / peak);
+  }
+  for (void* p : {static_cast<void*>(dcodes), static_cast<void*>(dsu), static_cast<void*>(dsv),
+                  static_cast<void*>(dx), static_cast<void*>(dm), static_cast<void*>(dxr),
+                  static_cast<void*>(dy)})
+    (void)hipFree(p);
+  return worst;
+}
+
+// q6g64_decode_f16 against the CPU decoder: max error over all values,
+// relative to the largest value.
+double RunQ6Decode(int rows, int cols, std::mt19937& rng) {
+  const std::size_t S = (static_cast<std::size_t>(13) * cols / 16 + 15) / 16 * 16;
+  std::vector<std::uint8_t> w(static_cast<std::size_t>(rows) * S);
+  for (auto& b : w) b = static_cast<std::uint8_t>(rng());
+  for (int r = 0; r < rows; ++r)
+    for (int g = 0; g < cols / 64; ++g) {
+      // Sane f16 scale and bias records (random bits could be inf/nan).
+      const float sc = 0.001f + 0.01f * static_cast<float>(rng() % 1000) / 1000.0f;
+      const float bi = -0.03f + 0.06f * static_cast<float>(rng() % 1000) / 1000.0f;
+      std::uint16_t h[2];
+      gufo::quant::FloatToHalfBits(&sc, &h[0], 1);
+      gufo::quant::FloatToHalfBits(&bi, &h[1], 1);
+      std::memcpy(&w[static_cast<std::size_t>(r) * S + 3 * cols / 4 + 4 * g], h, 4);
+    }
+  std::vector<float> ref(static_cast<std::size_t>(rows) * cols);
+  std::string err;
+  if (!gufo::quant::DecodeHgnToF32(gufo::core::GgmlType::kQ6G64, w.data(), cols, rows, nullptr,
+                                   nullptr, ref.data(), &err)) {
+    std::printf("CPU q6g64 decode failed: %s\n", err.c_str());
+    std::exit(2);
+  }
+  auto* dw = Up(w);
+  _Float16* dout = nullptr;
+  HIP_OK(hipMalloc(&dout, ref.size() * 2));
+  if (!q6g64_decode_f16(dw, rows, cols, dout, nullptr)) {
+    std::printf("q6g64 decode refused\n");
+    std::exit(2);
+  }
+  std::vector<_Float16> got(ref.size());
+  HIP_OK(hipMemcpy(got.data(), dout, got.size() * 2, hipMemcpyDeviceToHost));
+  double peak = 0.0, emax = 0.0;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    peak = std::max(peak, std::fabs(static_cast<double>(ref[i])));
+    emax = std::max(emax, std::fabs(static_cast<double>(ref[i]) - static_cast<double>(got[i])));
+  }
+  (void)hipFree(dw);
+  (void)hipFree(dout);
+  return emax / peak;
+}
+
 }  // namespace
 
 int main() {
@@ -231,6 +338,20 @@ int main() {
                   grp.size(), grp[0], n, e);
       failures += ok ? 0 : 1;
     }
+  }
+  for (const auto& s : std::vector<std::pair<int, int>>{{640, 2560}, {2560, 6144}, {512, 2560}}) {
+    const double e = RunWide(s.first, s.second, 24, rng);
+    const bool ok = e < kGate;
+    std::printf("%s wide prefill rows=%d cols=%d n=24 err=%.3e\n", ok ? "PASS" : "FAIL", s.first,
+                s.second, e);
+    failures += ok ? 0 : 1;
+  }
+  {
+    // f16 rounding of the decoded values: below 1e-3 of the largest value.
+    const double e = RunQ6Decode(300, 2560, rng);
+    const bool ok = e < 1e-3;
+    std::printf("%s q6g64 f16 decode err=%.3e\n", ok ? "PASS" : "FAIL", e);
+    failures += ok ? 0 : 1;
   }
   std::printf("%s\n", failures == 0 ? "ALL PASS" : "FAILURES");
 

@@ -36,6 +36,10 @@
 //     same as without sharing, so results are identical. Separate kernels
 //     (GateUpShareKernel, DownShareKernel), used for batches of 2..32 tokens,
 //     so the single-token and prefill kernels keep their register budget.
+//   * Prefill chunks (more than 32 tokens): the slots are first grouped by
+//     expert on the device (i4r_group_slots); GateUpGroupKernel and
+//     DownGroupKernel give each expert its workgroups, which load its codes
+//     once and run through all its slots with the same per-slot arithmetic.
 //
 // Rotation contract (unchanged from i4r_kernels.hip.cpp / the RFC):
 //   xr   = Hn(su_experts * x)                  (fused into gate+up's staging)
@@ -423,34 +427,21 @@ __global__ __launch_bounds__(kThreads) void GateUpKernel(GateUpArgs a) {
 // r / 4 (128 rows of ff); r % 4 picks gate/up (bit 1) and the 64-row half
 // (bit 0), so the four arrivals of a tile are adjacent.
 // ---------------------------------------------------------------------------
+// Gate + up of one expert's 64-row half tile for each member slot (slots
+// that selected `expert`), one slot at a time through the same LDS buffer;
+// the last of the tile's four workgroups to arrive at `counter` finishes the
+// tile of every member. Shared by the verify (share) and prefill (grouped)
+// kernels.
 template <int NB, bool kSplitInput>
-__global__ __launch_bounds__(kThreads) void GateUpShareKernel(GateUpArgs a) {
+__device__ __forceinline__ void GateUpMembers(const GateUpArgs& a, int expert, int tile,
+                                              int which, int half, const int* members,
+                                              int n_mem, unsigned* counter, _Float16* xh,
+                                              _Float16* xl) {
   constexpr int kIn = NB * 128;
-  __shared__ __attribute__((aligned(16))) _Float16 xh[kIn];
-  __shared__ __attribute__((aligned(16))) _Float16 xl[kSplitInput ? kIn : 8];
-
-  const int tiles = a.ff / 128;
-  const int per_slot = tiles * 4;
-  const int routed_wgs = per_slot * a.n_tokens * a.used;
-  if (static_cast<int>(blockIdx.x) >= routed_wgs) {
-    SharedDownRange<kSplitInput>(a, blockIdx.x - routed_wgs, xh, xl);
-    return;
-  }
-  const int slot = blockIdx.x / per_slot;
-  const int r = blockIdx.x % per_slot;
-  const int tile = r >> 2;
-  const int which = (r >> 1) & 1;  // 0 gate, 1 up
-  const int half = r & 1;
   const int tid = threadIdx.x;
   const int lane_row = tid >> 2;  // 0..63
   const int q = tid & 3;
   const int row = tile * 128 + half * 64 + lane_row;
-
-  __shared__ int members[kMaxMembers];
-  const int n_mem = ExpertMembers(a.ids, slot, a.n_tokens * a.used, a.n_tokens, members);
-  if (n_mem == 0) return;
-
-  const int expert = a.ids[slot];
   const std::uint8_t* base = which == 0 ? a.gate : a.up;
   const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
   const std::size_t exp_rows = static_cast<std::size_t>(a.ff);
@@ -509,7 +500,7 @@ __global__ __launch_bounds__(kThreads) void GateUpShareKernel(GateUpArgs a) {
 
   // The owner slot's four workgroups arrive for every member: they all hold
   // the same member list, so the last of them finishes the tile of each.
-  if (!LastArrival(a.counters + slot * tiles + tile, 4u)) return;
+  if (!LastArrival(counter, 4u)) return;
   if (tid >= kWave) return;
 
   // Finisher (one wave), per member slot: g, u rotated out of the matmul
@@ -541,6 +532,57 @@ __global__ __launch_bounds__(kThreads) void GateUpShareKernel(GateUpArgs a) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) gp[lane + 32 * j] = h[j];
   }
+}
+
+template <int NB, bool kSplitInput>
+__global__ __launch_bounds__(kThreads) void GateUpShareKernel(GateUpArgs a) {
+  constexpr int kIn = NB * 128;
+  __shared__ __attribute__((aligned(16))) _Float16 xh[kIn];
+  __shared__ __attribute__((aligned(16))) _Float16 xl[kSplitInput ? kIn : 8];
+
+  const int tiles = a.ff / 128;
+  const int per_slot = tiles * 4;
+  const int routed_wgs = per_slot * a.n_tokens * a.used;
+  if (static_cast<int>(blockIdx.x) >= routed_wgs) {
+    SharedDownRange<kSplitInput>(a, blockIdx.x - routed_wgs, xh, xl);
+    return;
+  }
+  const int slot = blockIdx.x / per_slot;
+  const int r = blockIdx.x % per_slot;
+  const int tile = r >> 2;
+  const int which = (r >> 1) & 1;  // 0 gate, 1 up
+  const int half = r & 1;
+  __shared__ int members[kMaxMembers];
+  const int n_mem = ExpertMembers(a.ids, slot, a.n_tokens * a.used, a.n_tokens, members);
+  if (n_mem == 0) return;
+  GateUpMembers<NB, kSplitInput>(a, a.ids[slot], tile, which, half, members, n_mem,
+                                 a.counters + slot * tiles + tile, xh, xl);
+}
+
+
+// Gate + up for a prefill chunk, slots grouped by expert (i4r_group_slots):
+// grid.x = n_experts * (2 * ff / 64), then the shared-expert range. Expert e's
+// workgroups load its codes once and run through all its slots; experts no
+// slot selected exit at once.
+template <int NB, bool kSplitInput>
+__global__ __launch_bounds__(kThreads) void GateUpGroupKernel(GateUpArgs a) {
+  constexpr int kIn = NB * 128;
+  __shared__ __attribute__((aligned(16))) _Float16 xh[kIn];
+  __shared__ __attribute__((aligned(16))) _Float16 xl[kSplitInput ? kIn : 8];
+  const int tiles = a.ff / 128;
+  const int per_expert = tiles * 4;
+  const int routed_wgs = per_expert * static_cast<int>(a.n_experts);
+  if (static_cast<int>(blockIdx.x) >= routed_wgs) {
+    SharedDownRange<kSplitInput>(a, blockIdx.x - routed_wgs, xh, xl);
+    return;
+  }
+  const int e = blockIdx.x / per_expert;
+  const int r = blockIdx.x % per_expert;
+  const int off = a.group_offsets[e];
+  const int n_mem = a.group_offsets[e + 1] - off;
+  if (n_mem == 0) return;
+  GateUpMembers<NB, kSplitInput>(a, e, r >> 2, (r >> 1) & 1, r & 1, a.group_slots + off, n_mem,
+                                 a.group_counters + e * tiles + (r >> 2), xh, xl);
 }
 
 // Combine for one token's 128-row output tile (one wave): weighted sum of
@@ -696,32 +738,21 @@ __global__ __launch_bounds__(kThreads) void DownKernel(DownArgs a) {
 // grid.x = n_tokens * (hidden / 128) * used * 2. Within a token, the 2*used
 // workgroups of one output tile are adjacent.
 // ---------------------------------------------------------------------------
+// Down of one expert's 64-row half tile for each member slot, then one
+// arrival per member token's output tile; the last to arrive at a token's
+// tile combines it. Shared by the verify (share) and prefill (grouped)
+// kernels.
 template <int NB, bool kSplitInput>
-__global__ __launch_bounds__(kThreads) void DownShareKernel(DownArgs a) {
+__device__ __forceinline__ void DownMembers(const DownArgs& a, int expert, int tile, int half,
+                                            const int* members, int n_mem, _Float16* xh,
+                                            _Float16* xl) {
   constexpr int kIn = NB * 128;
-  __shared__ __attribute__((aligned(16))) _Float16 xh[kIn];
-  __shared__ __attribute__((aligned(16))) _Float16 xl[kSplitInput ? kIn : 8];
-
   const int tiles = a.hidden / 128;
   const int per_tile = a.used * 2;
-  const int per_token = tiles * per_tile;
-  const int token = blockIdx.x / per_token;
-  const int r = blockIdx.x % per_token;
-  const int tile = r / per_tile;
-  const int k = (r % per_tile) >> 1;
-  const int half = r & 1;
-  const int slot = token * a.used + k;
   const int tid = threadIdx.x;
   const int lane_row = tid >> 2;
   const int q = tid & 3;
   const int row = tile * 128 + half * 64 + lane_row;
-
-  const int n_tokens = static_cast<int>(gridDim.x) / per_token;
-  __shared__ int members[kMaxMembers];
-  const int n_mem = ExpertMembers(a.ids, slot, n_tokens * a.used, n_tokens, members);
-  if (n_mem == 0) return;
-
-  const int expert = a.ids[slot];
   const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
   const std::size_t exp_rows = static_cast<std::size_t>(a.hidden);
   const std::uint8_t* codes_row =
@@ -769,6 +800,76 @@ __global__ __launch_bounds__(kThreads) void DownShareKernel(DownArgs a) {
         LastArrival(a.counters + mt * tiles + tile, static_cast<unsigned>(per_tile));
     if (last && tid < kWave) Combine(a, mt, tile);
   }
+}
+
+template <int NB, bool kSplitInput>
+__global__ __launch_bounds__(kThreads) void DownShareKernel(DownArgs a) {
+  constexpr int kIn = NB * 128;
+  __shared__ __attribute__((aligned(16))) _Float16 xh[kIn];
+  __shared__ __attribute__((aligned(16))) _Float16 xl[kSplitInput ? kIn : 8];
+
+  const int tiles = a.hidden / 128;
+  const int per_tile = a.used * 2;
+  const int per_token = tiles * per_tile;
+  const int token = blockIdx.x / per_token;
+  const int r = blockIdx.x % per_token;
+  const int tile = r / per_tile;
+  const int k = (r % per_tile) >> 1;
+  const int half = r & 1;
+  const int slot = token * a.used + k;
+  const int n_tokens = static_cast<int>(gridDim.x) / per_token;
+  __shared__ int members[kMaxMembers];
+  const int n_mem = ExpertMembers(a.ids, slot, n_tokens * a.used, n_tokens, members);
+  if (n_mem == 0) return;
+  DownMembers<NB, kSplitInput>(a, a.ids[slot], tile, half, members, n_mem, xh, xl);
+}
+
+// Down for a prefill chunk, slots grouped by expert: grid.x = n_experts *
+// (hidden / 128) * 2.
+template <int NB, bool kSplitInput>
+__global__ __launch_bounds__(kThreads) void DownGroupKernel(DownArgs a) {
+  constexpr int kIn = NB * 128;
+  __shared__ __attribute__((aligned(16))) _Float16 xh[kIn];
+  __shared__ __attribute__((aligned(16))) _Float16 xl[kSplitInput ? kIn : 8];
+  const int per_expert = (a.hidden / 128) * 2;
+  const int e = blockIdx.x / per_expert;
+  const int r = blockIdx.x % per_expert;
+  const int off = a.group_offsets[e];
+  const int n_mem = a.group_offsets[e + 1] - off;
+  if (n_mem == 0) return;
+  DownMembers<NB, kSplitInput>(a, e, r >> 1, r & 1, a.group_slots + off, n_mem, xh, xl);
+}
+
+
+// ---------------------------------------------------------------------------
+// Slot grouping for prefill: offsets[e + 1] counts the slots that selected
+// expert e, an exclusive scan turns counts into offsets, and a scatter writes
+// each slot at its expert's cursor. The order within an expert depends on
+// the atomics, but each slot's result does not depend on that order.
+// ---------------------------------------------------------------------------
+__global__ void GroupCountKernel(const std::int32_t* __restrict__ ids, int n_slots,
+                                 std::int32_t* __restrict__ offsets) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_slots) atomicAdd(&offsets[ids[i] + 1], 1);
+}
+
+__global__ void GroupScanKernel(std::int32_t* __restrict__ offsets,
+                                std::int32_t* __restrict__ cursor, int n_experts) {
+  if (threadIdx.x != 0) return;
+  std::int32_t run = 0;
+  for (int e = 0; e < n_experts; ++e) {
+    cursor[e] = run;
+    run += offsets[e + 1];
+    offsets[e + 1] = run;
+  }
+  offsets[0] = 0;
+}
+
+__global__ void GroupScatterKernel(const std::int32_t* __restrict__ ids, int n_slots,
+                                   std::int32_t* __restrict__ cursor,
+                                   std::int32_t* __restrict__ slots) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_slots) slots[atomicAdd(&cursor[ids[i]], 1)] = i;
 }
 
 // ---------------------------------------------------------------------------
@@ -825,12 +926,19 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
       return false;
     wgs += static_cast<unsigned>(a.n_tokens) * (a.hidden / 128u) * (a.shared_ff / 128u);
   }
+  const bool group = a.group_offsets != nullptr;
+  if (group) wgs = static_cast<unsigned>(a.n_experts) * (2u * a.ff / 64u) +
+                   (wgs - static_cast<unsigned>(n_slots) * (2u * a.ff / 64u));
   const dim3 grid(wgs);
-  const bool share = gufo::quant::fused::ShareExperts(a.n_tokens, n_slots);
+  const bool share = !group && gufo::quant::fused::ShareExperts(a.n_tokens, n_slots);
   switch (a.hidden / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
-    if (share && a.plain_f16)                                                \
+    if (group && a.plain_f16)                                                \
+      gufo::quant::fused::GateUpGroupKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
+    else if (group)                                                          \
+      gufo::quant::fused::GateUpGroupKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
+    else if (share && a.plain_f16)                                           \
       gufo::quant::fused::GateUpShareKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else if (share)                                                          \
       gufo::quant::fused::GateUpShareKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
@@ -856,12 +964,18 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
 bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
   const I4rDownArgs& a = *args;
   if (a.ff % 128 != 0 || a.hidden % 128 != 0 || n_tokens <= 0) return false;
-  const dim3 grid(static_cast<unsigned>(n_tokens) * (a.hidden / 128u) * a.used * 2u);
-  const bool share = gufo::quant::fused::ShareExperts(n_tokens, n_tokens * a.used);
+  const bool group = a.group_offsets != nullptr;
+  const dim3 grid(group ? static_cast<unsigned>(a.n_experts) * (a.hidden / 128u) * 2u
+                        : static_cast<unsigned>(n_tokens) * (a.hidden / 128u) * a.used * 2u);
+  const bool share = !group && gufo::quant::fused::ShareExperts(n_tokens, n_tokens * a.used);
   switch (a.ff / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
-    if (share && a.plain_f16)                                                \
+    if (group && a.plain_f16)                                                \
+      gufo::quant::fused::DownGroupKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
+    else if (group)                                                          \
+      gufo::quant::fused::DownGroupKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
+    else if (share && a.plain_f16)                                           \
       gufo::quant::fused::DownShareKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else if (share)                                                          \
       gufo::quant::fused::DownShareKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
@@ -881,6 +995,20 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
     default:
       return false;
   }
+}
+
+bool i4r_group_slots(const std::int32_t* ids, int n_slots, int n_experts,
+                     std::int32_t* offsets, std::int32_t* cursor, std::int32_t* slots,
+                     hipStream_t stream) {
+  if (n_slots <= 0 || n_experts <= 0) return false;
+  if (hipMemsetAsync(offsets, 0, (static_cast<std::size_t>(n_experts) + 1) * sizeof(std::int32_t),
+                     stream) != hipSuccess)
+    return false;
+  const unsigned blocks = static_cast<unsigned>((n_slots + 255) / 256);
+  gufo::quant::fused::GroupCountKernel<<<blocks, 256, 0, stream>>>(ids, n_slots, offsets);
+  gufo::quant::fused::GroupScanKernel<<<1, 32, 0, stream>>>(offsets, cursor, n_experts);
+  gufo::quant::fused::GroupScatterKernel<<<blocks, 256, 0, stream>>>(ids, n_slots, cursor, slots);
+  return hipGetLastError() == hipSuccess;
 }
 
 bool i4r_repack_q8_split(const std::uint8_t* src, std::uint8_t* dst,
