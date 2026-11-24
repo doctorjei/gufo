@@ -28,6 +28,14 @@
 //     registers within one wave, SwiGLU, the weighted combine over experts,
 //     the output rotation once on the combined sum, and the gated shared
 //     expert.
+//   * Experts shared across a batch (MTP verify): the first slot in the batch
+//     that selected an expert owns it. Its workgroups load the expert's codes
+//     once and apply them to every token that selected it, one token at a
+//     time through the same LDS buffer; the other slots' workgroups exit at
+//     once. Arrival counts are unchanged, and each token's arithmetic is the
+//     same as without sharing, so results are identical. Separate kernels
+//     (GateUpShareKernel, DownShareKernel), used for batches of 2..32 tokens,
+//     so the single-token and prefill kernels keep their register budget.
 //
 // Rotation contract (unchanged from i4r_kernels.hip.cpp / the RFC):
 //   xr   = Hn(su_experts * x)                  (fused into gate+up's staging)
@@ -176,6 +184,47 @@ __device__ __forceinline__ bool LastArrival(unsigned* counter, unsigned expected
 // non-coherent per-CU cache).
 __device__ __forceinline__ float LoadPartial(const float* p) {
   return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+// Most tokens a batch can share an expert across (one member per token).
+constexpr int kMaxMembers = 32;
+constexpr int kMaxScanSlots = 256;
+
+// Whether a batch uses the expert-sharing kernels: verify-sized batches only.
+// Single tokens and prefill chunks keep the plain kernels.
+__host__ __device__ inline bool ShareExperts(int n_tokens, int n_slots) {
+  return n_tokens > 1 && n_tokens <= kMaxMembers && n_slots <= kMaxScanSlots;
+}
+
+// Finds the slots of the batch that selected this slot's expert. Returns the
+// member count (uniform over the workgroup): 0 when an earlier slot owns the
+// expert (this workgroup has nothing to do), else the members in slot order,
+// starting with this slot. Within a token the selected experts are distinct,
+// so the members are in distinct tokens. Without sharing (one token, or a
+// batch too large for the scan) every slot owns itself.
+__device__ __forceinline__ int ExpertMembers(const std::int32_t* ids, int slot, int n_slots,
+                                             int n_tokens, int* members) {
+  __shared__ std::int32_t sid[kMaxScanSlots];
+  __shared__ int count;
+  if (!ShareExperts(n_tokens, n_slots)) {
+    if (threadIdx.x == 0) members[0] = slot;
+    __syncthreads();
+    return 1;
+  }
+  for (int j = threadIdx.x; j < n_slots; j += blockDim.x) sid[j] = ids[j];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const std::int32_t e = sid[slot];
+    int n = 0;
+    for (int j = 0; j < n_slots; ++j) {
+      if (sid[j] != e) continue;
+      if (j < slot) { n = 0; break; }
+      members[n++] = j;
+    }
+    count = n;
+  }
+  __syncthreads();
+  return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +413,179 @@ __global__ __launch_bounds__(kThreads) void GateUpKernel(GateUpArgs a) {
 }
 
 // ---------------------------------------------------------------------------
+// Gate + up for a verify batch with experts shared across tokens (see the
+// file comment); same layout and finisher as GateUpKernel. A separate kernel
+// so the single-token and prefill path keeps its register budget.
+// Gate + up for every selected (token, slot), with the input rotation fused
+// into the LDS staging and SwiGLU + down-input rotation in the finisher.
+//
+// grid.x = n_slots * (2 * ff / 64). Within a slot, workgroup r covers tile
+// r / 4 (128 rows of ff); r % 4 picks gate/up (bit 1) and the 64-row half
+// (bit 0), so the four arrivals of a tile are adjacent.
+// ---------------------------------------------------------------------------
+template <int NB, bool kSplitInput>
+__global__ __launch_bounds__(kThreads) void GateUpShareKernel(GateUpArgs a) {
+  constexpr int kIn = NB * 128;
+  __shared__ __attribute__((aligned(16))) _Float16 xh[kIn];
+  __shared__ __attribute__((aligned(16))) _Float16 xl[kSplitInput ? kIn : 8];
+
+  const int tiles = a.ff / 128;
+  const int per_slot = tiles * 4;
+  const int routed_wgs = per_slot * a.n_tokens * a.used;
+  if (static_cast<int>(blockIdx.x) >= routed_wgs) {
+    SharedDownRange<kSplitInput>(a, blockIdx.x - routed_wgs, xh, xl);
+    return;
+  }
+  const int slot = blockIdx.x / per_slot;
+  const int r = blockIdx.x % per_slot;
+  const int tile = r >> 2;
+  const int which = (r >> 1) & 1;  // 0 gate, 1 up
+  const int half = r & 1;
+  const int tid = threadIdx.x;
+  const int lane_row = tid >> 2;  // 0..63
+  const int q = tid & 3;
+  const int row = tile * 128 + half * 64 + lane_row;
+
+  __shared__ int members[kMaxMembers];
+  const int n_mem = ExpertMembers(a.ids, slot, a.n_tokens * a.used, a.n_tokens, members);
+  if (n_mem == 0) return;
+
+  const int expert = a.ids[slot];
+  const std::uint8_t* base = which == 0 ? a.gate : a.up;
+  const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
+  const std::size_t exp_rows = static_cast<std::size_t>(a.ff);
+  const std::uint8_t* codes_row =
+      base + (static_cast<std::size_t>(expert) * exp_rows + row) * row_codes;
+  const __half* scales_row =
+      reinterpret_cast<const __half*>(base + a.n_experts * exp_rows * row_codes) +
+      (static_cast<std::size_t>(expert) * exp_rows + row) * NB;
+
+  // Issue this lane's code loads first; the staging below overlaps them.
+  u32x4 c[NB];
+#pragma unroll
+  for (int b = 0; b < NB; ++b)
+    c[b] = __builtin_nontemporal_load(
+        reinterpret_cast<const u32x4*>(codes_row + b * 64 + q * 16));
+#pragma unroll 1
+  for (int m = 0; m < n_mem; ++m) {
+    const int ms = members[m];
+    const int mt = ms / a.used;
+    if (m > 0) __syncthreads();  // the previous token's dot is done with LDS
+    // Keep the code unpacking inside the loop: unpacked once for all tokens
+    // it would need far more registers than the packed codes.
+#pragma unroll
+    for (int b = 0; b < NB; ++b) asm volatile("" : "+v"(c[b]));
+    // Stage xr = Hn(su * x[token]) into LDS: wave w rotates blocks w, w+8, ...
+    {
+      const int wave = tid / kWave;
+      const int lane = tid & (kWave - 1);
+      const float* x = a.x + static_cast<std::size_t>(mt) * kIn;
+      for (int b = wave; b < NB; b += kThreads / kWave) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int i = b * 128 + lane + 32 * j;
+          v[j] = x[i] * a.su_experts[i];
+        }
+        Fwht128Wave(v);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) StageValue<kSplitInput>(xh, xl, b * 128 + lane + 32 * j, v[j]);
+      }
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int b = 0; b < NB; ++b)
+      acc = fmaf(DotQuarter<kSplitInput>(c[b], xh + b * 128, xl + b * 128, q),
+                 __half2float(scales_row[b]), acc);
+    acc += __shfl_xor(acc, 1, kWave);
+    acc += __shfl_xor(acc, 2, kWave);
+
+    float* part = (which == 0 ? a.gate_part : a.up_part) +
+                  static_cast<std::size_t>(ms) * a.ff;
+    if (q == 0) part[row] = acc;
+  }
+
+  // The owner slot's four workgroups arrive for every member: they all hold
+  // the same member list, so the last of them finishes the tile of each.
+  if (!LastArrival(a.counters + slot * tiles + tile, 4u)) return;
+  if (tid >= kWave) return;
+
+  // Finisher (one wave), per member slot: g, u rotated out of the matmul
+  // basis, SwiGLU, then rotated into down's input basis. Written in place
+  // over the gate partials of this tile (only this wave touches them now).
+  const int lane = tid;
+#pragma unroll 1
+  for (int m = 0; m < n_mem; ++m) {
+    const int ms = members[m];
+    float* gp = a.gate_part + static_cast<std::size_t>(ms) * a.ff + tile * 128;
+    const float* up = a.up_part + static_cast<std::size_t>(ms) * a.ff + tile * 128;
+    float g[4], u[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      g[j] = LoadPartial(gp + lane + 32 * j);
+      u[j] = LoadPartial(up + lane + 32 * j);
+    }
+    Fwht128Wave(g);
+    Fwht128Wave(u);
+    float h[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int i = tile * 128 + lane + 32 * j;
+      const float gv = g[j] * a.sv_gate[i];
+      const float uv = u[j] * a.sv_up[i];
+      h[j] = Silu(gv) * uv * a.su_down[i];
+    }
+    Fwht128Wave(h);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) gp[lane + 32 * j] = h[j];
+  }
+}
+
+// Combine for one token's 128-row output tile (one wave): weighted sum of
+// the token's slots, the output rotation once on the sum, the gated shared
+// expert.
+__device__ __forceinline__ void Combine(const DownArgs& a, int token, int tile) {
+  const int lane = threadIdx.x;
+  float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int e = 0; e < a.used; ++e) {
+    const int sl = token * a.used + e;
+    const float w = a.weights[sl];
+    float* p = a.down_part + static_cast<std::size_t>(sl) * a.hidden + tile * 128;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      v[j] = LoadPartial(p + lane + 32 * j);
+      sum[j] = fmaf(w, v[j], sum[j]);
+    }
+    if (a.per_slot_out) {
+      // Test seam: the unweighted, fully rotated output of this slot, in
+      // the [slots x hidden] layout of the unfused path.
+      Fwht128Wave(v);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int i = tile * 128 + lane + 32 * j;
+        p[lane + 32 * j] = v[j] * a.sv_down[i];
+      }
+    }
+  }
+  Fwht128Wave(sum);
+  const float gate = a.shared_out != nullptr
+                         ? Sigmoid(a.shared_gate[static_cast<std::size_t>(token) *
+                                                 a.shared_gate_stride])
+                         : 0.0f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int i = tile * 128 + lane + 32 * j;
+    float o = sum[j] * a.sv_down[i];
+    if (a.shared_out != nullptr)
+      o = fmaf(gate, a.shared_out[static_cast<std::size_t>(token) * a.hidden + i], o);
+    a.out[static_cast<std::size_t>(token) * a.hidden + i] = o;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Down for every selected slot, then the combine over slots in the last
 // workgroup to arrive at each 128-row output tile of a token.
 //
@@ -466,6 +688,90 @@ __global__ __launch_bounds__(kThreads) void DownKernel(DownArgs a) {
 }
 
 // ---------------------------------------------------------------------------
+// Down for a verify batch with experts shared across tokens; same layout and
+// combine as DownKernel.
+// Down for every selected slot, then the combine over slots in the last
+// workgroup to arrive at each 128-row output tile of a token.
+//
+// grid.x = n_tokens * (hidden / 128) * used * 2. Within a token, the 2*used
+// workgroups of one output tile are adjacent.
+// ---------------------------------------------------------------------------
+template <int NB, bool kSplitInput>
+__global__ __launch_bounds__(kThreads) void DownShareKernel(DownArgs a) {
+  constexpr int kIn = NB * 128;
+  __shared__ __attribute__((aligned(16))) _Float16 xh[kIn];
+  __shared__ __attribute__((aligned(16))) _Float16 xl[kSplitInput ? kIn : 8];
+
+  const int tiles = a.hidden / 128;
+  const int per_tile = a.used * 2;
+  const int per_token = tiles * per_tile;
+  const int token = blockIdx.x / per_token;
+  const int r = blockIdx.x % per_token;
+  const int tile = r / per_tile;
+  const int k = (r % per_tile) >> 1;
+  const int half = r & 1;
+  const int slot = token * a.used + k;
+  const int tid = threadIdx.x;
+  const int lane_row = tid >> 2;
+  const int q = tid & 3;
+  const int row = tile * 128 + half * 64 + lane_row;
+
+  const int n_tokens = static_cast<int>(gridDim.x) / per_token;
+  __shared__ int members[kMaxMembers];
+  const int n_mem = ExpertMembers(a.ids, slot, n_tokens * a.used, n_tokens, members);
+  if (n_mem == 0) return;
+
+  const int expert = a.ids[slot];
+  const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
+  const std::size_t exp_rows = static_cast<std::size_t>(a.hidden);
+  const std::uint8_t* codes_row =
+      a.down + (static_cast<std::size_t>(expert) * exp_rows + row) * row_codes;
+  const __half* scales_row =
+      reinterpret_cast<const __half*>(a.down + a.n_experts * exp_rows * row_codes) +
+      (static_cast<std::size_t>(expert) * exp_rows + row) * NB;
+
+  u32x4 c[NB];
+#pragma unroll
+  for (int b = 0; b < NB; ++b)
+    c[b] = __builtin_nontemporal_load(
+        reinterpret_cast<const u32x4*>(codes_row + b * 64 + q * 16));
+#pragma unroll 1
+  for (int m = 0; m < n_mem; ++m) {
+    const int ms = members[m];
+    if (m > 0) __syncthreads();  // the previous slot's dot is done with LDS
+    // Keep the code unpacking inside the loop: unpacked once for all tokens
+    // it would need far more registers than the packed codes.
+#pragma unroll
+    for (int b = 0; b < NB; ++b) asm volatile("" : "+v"(c[b]));
+    // Stage this slot's down input (already rotated by gate+up's finisher).
+    const float* din = a.down_in + static_cast<std::size_t>(ms) * kIn;
+    for (int i = tid; i < kIn; i += kThreads) StageValue<kSplitInput>(xh, xl, i, din[i]);
+    __syncthreads();
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int b = 0; b < NB; ++b)
+      acc = fmaf(DotQuarter<kSplitInput>(c[b], xh + b * 128, xl + b * 128, q),
+                 __half2float(scales_row[b]), acc);
+    acc += __shfl_xor(acc, 1, kWave);
+    acc += __shfl_xor(acc, 2, kWave);
+
+    float* part = a.down_part + static_cast<std::size_t>(ms) * a.hidden;
+    if (q == 0) part[row] = acc;
+  }
+
+  // One arrival per member token's tile (each slot still gets exactly two,
+  // one per half); the last to arrive at a token's tile combines it.
+#pragma unroll 1
+  for (int m = 0; m < n_mem; ++m) {
+    const int mt = members[m] / a.used;
+    const bool last =
+        LastArrival(a.counters + mt * tiles + tile, static_cast<unsigned>(per_tile));
+    if (last && tid < kWave) Combine(a, mt, tile);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Load-time repack: interleaved 66-byte blocks -> codes region + scales
 // region, for a whole [n_experts x rows] tensor. One thread per block.
 // ---------------------------------------------------------------------------
@@ -520,10 +826,15 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
     wgs += static_cast<unsigned>(a.n_tokens) * (a.hidden / 128u) * (a.shared_ff / 128u);
   }
   const dim3 grid(wgs);
+  const bool share = gufo::quant::fused::ShareExperts(a.n_tokens, n_slots);
   switch (a.hidden / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
-    if (a.plain_f16)                                                         \
+    if (share && a.plain_f16)                                                \
+      gufo::quant::fused::GateUpShareKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
+    else if (share)                                                          \
+      gufo::quant::fused::GateUpShareKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
+    else if (a.plain_f16)                                                    \
       gufo::quant::fused::GateUpKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else                                                                     \
       gufo::quant::fused::GateUpKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
@@ -546,10 +857,15 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
   const I4rDownArgs& a = *args;
   if (a.ff % 128 != 0 || a.hidden % 128 != 0 || n_tokens <= 0) return false;
   const dim3 grid(static_cast<unsigned>(n_tokens) * (a.hidden / 128u) * a.used * 2u);
+  const bool share = gufo::quant::fused::ShareExperts(n_tokens, n_tokens * a.used);
   switch (a.ff / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
-    if (a.plain_f16)                                                         \
+    if (share && a.plain_f16)                                                \
+      gufo::quant::fused::DownShareKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
+    else if (share)                                                          \
+      gufo::quant::fused::DownShareKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
+    else if (a.plain_f16)                                                    \
       gufo::quant::fused::DownKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else                                                                     \
       gufo::quant::fused::DownKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \

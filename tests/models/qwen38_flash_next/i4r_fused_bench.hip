@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -263,6 +264,56 @@ int NewLayer(const Layer& L, const Scratch& s, const std::int32_t* ids_dev,
   return launches;
 }
 
+// A verify-style batch: n_tokens tokens, each with kUsed experts, through the
+// two batched launches (no shared expert). Buffers sized for n_tokens.
+struct Batch {
+  float* x;       // [T x hidden]
+  float* gate_e;  // [T*used x ff]
+  float* up_e;
+  float* down_e;  // [T*used x hidden]
+  float* weights; // [T*used]
+  float* out;     // [T x hidden]
+  unsigned* cnt_up;
+  unsigned* cnt_down;
+};
+
+void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const float* x,
+              const float* weights, float* out, int n_tokens, std::size_t n_experts,
+              hipStream_t st) {
+  I4rGateUpArgs gu{};
+  gu.gate = L.gate_new;
+  gu.up = L.up_new;
+  gu.n_experts = n_experts;
+  gu.x = x;
+  gu.ids = ids;
+  gu.su_experts = L.su_experts;
+  gu.sv_gate = L.sv_gate;
+  gu.sv_up = L.sv_up;
+  gu.su_down = L.su_down;
+  gu.gate_part = b.gate_e;
+  gu.up_part = b.up_e;
+  gu.counters = b.cnt_up;
+  gu.hidden = kHidden;
+  gu.ff = kFf;
+  gu.used = kUsed;
+  gu.n_tokens = n_tokens;
+  if (!i4r_fused_gate_up(&gu, n_tokens * kUsed, st)) std::exit(3);
+  I4rDownArgs dn{};
+  dn.down = L.down_new;
+  dn.n_experts = n_experts;
+  dn.down_in = b.gate_e;
+  dn.ids = ids;
+  dn.weights = weights;
+  dn.sv_down = L.sv_down;
+  dn.down_part = b.down_e;
+  dn.out = out;
+  dn.counters = b.cnt_down;
+  dn.hidden = kHidden;
+  dn.ff = kFf;
+  dn.used = kUsed;
+  if (!i4r_fused_down(&dn, n_tokens, st)) std::exit(3);
+}
+
 std::vector<float> Download(const float* d, std::size_t n) {
   std::vector<float> h(n);
   HIP_OK(hipDeviceSynchronize());
@@ -387,6 +438,9 @@ int main(int argc, char** argv) {
 
   hipStream_t st;
   HIP_OK(hipStreamCreateWithFlags(&st, hipStreamNonBlocking));
+  hipEvent_t e0, e1;
+  HIP_OK(hipEventCreate(&e0));
+  HIP_OK(hipEventCreate(&e1));
   int fails = 0;
 
   // ---- Real-geometry cross-check against the unbatched path ----
@@ -461,12 +515,95 @@ int main(int argc, char** argv) {
   }
   FreeMemLine("cross-check done");
 
+  // ---- Verify batches: experts shared across tokens ----
+  // 8 tokens, each drawing kUsed distinct experts from a pool. With a small
+  // pool most experts are shared, and each expert's workgroups serve every
+  // token that selected it. The batched output must equal, bit for bit, each
+  // token run on its own.
+  double t_batch_shared = 0, t_batch_distinct = 0, t_batch_one = 0;
+  {
+    constexpr int kT = 8;
+    Batch b{};
+    b.x = falloc(kT * kHidden);
+    b.gate_e = falloc(kT * kUsed * kFf);
+    b.up_e = falloc(kT * kUsed * kFf);
+    b.down_e = falloc(kT * kUsed * kHidden);
+    b.weights = falloc(kT * kUsed);
+    b.out = falloc(kT * kHidden);
+    HIP_OK(hipMalloc(&b.cnt_up, kT * kUsed * (kFf / 128) * sizeof(unsigned)));
+    HIP_OK(hipMemset(b.cnt_up, 0, kT * kUsed * (kFf / 128) * sizeof(unsigned)));
+    HIP_OK(hipMalloc(&b.cnt_down, kT * (kHidden / 128) * sizeof(unsigned)));
+    HIP_OK(hipMemset(b.cnt_down, 0, kT * (kHidden / 128) * sizeof(unsigned)));
+    float* ref = falloc(kT * kHidden);
+    {
+      std::vector<float> x(kT * kHidden), w(kT * kUsed);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      for (auto& v : x) v = nd(rng);
+      for (auto& v : w) v = 0.05f + 0.1f * std::abs(nd(rng));
+      HIP_OK(hipMemcpy(b.x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice));
+      HIP_OK(hipMemcpy(b.weights, w.data(), w.size() * sizeof(float), hipMemcpyHostToDevice));
+    }
+    auto make_ids = [&](std::size_t pool) {
+      std::vector<std::int32_t> ids(kT * kUsed), perm(pool);
+      for (std::size_t i = 0; i < pool; ++i) perm[i] = static_cast<std::int32_t>(i);
+      for (int t = 0; t < kT; ++t) {
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (int k = 0; k < kUsed; ++k) ids[t * kUsed + k] = perm[k];
+      }
+      std::int32_t* d = nullptr;
+      HIP_OK(hipMalloc(&d, ids.size() * sizeof(std::int32_t)));
+      HIP_OK(hipMemcpy(d, ids.data(), ids.size() * sizeof(std::int32_t), hipMemcpyHostToDevice));
+      std::vector<bool> seen(pool, false);
+      int n = 0;
+      for (auto e : ids) if (!seen[e]) { seen[e] = true; ++n; }
+      return std::make_pair(d, n);
+    };
+    const std::size_t pool = std::min<std::size_t>(16, n_exp);
+    auto [ids_shared, n_shared] = make_ids(pool);
+    auto [ids_distinct, n_distinct] = make_ids(n_exp);
+    int mism = 0;
+    for (int which = 0; which < 2; ++which) {
+      const std::int32_t* ids = which == 0 ? ids_shared : ids_distinct;
+      for (int t = 0; t < kT; ++t)
+        RunBatch(layers[0], b, ids + t * kUsed, b.x + t * kHidden, b.weights + t * kUsed,
+                 ref + t * kHidden, 1, n_exp, st);
+      const auto r = Download(ref, kT * kHidden);
+      RunBatch(layers[0], b, ids, b.x, b.weights, b.out, kT, n_exp, st);
+      const auto g = Download(b.out, kT * kHidden);
+      int m = 0;
+      for (std::size_t i = 0; i < r.size(); ++i) m += std::memcmp(&r[i], &g[i], sizeof(float)) != 0;
+      std::printf("batch of %d, %s experts (%d distinct of %d slots): %d of %zu outputs differ from per-token runs\n",
+                  kT, which == 0 ? "shared" : "mostly distinct", which == 0 ? n_shared : n_distinct,
+                  kT * kUsed, m, r.size());
+      mism += m;
+    }
+    if (mism != 0) {
+      std::printf("FAIL: shared-expert batch is not bit-identical to per-token runs\n");
+      ++fails;
+    }
+    auto time_batch = [&](const std::int32_t* ids, int n_tokens) {
+      for (int i = 0; i < 16; ++i)
+        RunBatch(layers[i % n_layers], b, ids, b.x, b.weights, b.out, n_tokens, n_exp, st);
+      HIP_OK(hipEventRecord(e0, st));
+      for (int i = 0; i < iters; ++i)
+        RunBatch(layers[i % n_layers], b, ids, b.x, b.weights, b.out, n_tokens, n_exp, st);
+      HIP_OK(hipEventRecord(e1, st));
+      HIP_OK(hipEventSynchronize(e1));
+      float ms = 0;
+      HIP_OK(hipEventElapsedTime(&ms, e0, e1));
+      return 1000.0 * ms / iters;
+    };
+    t_batch_one = time_batch(ids_distinct, 1);
+    t_batch_distinct = time_batch(ids_distinct, kT);
+    t_batch_shared = time_batch(ids_shared, kT);
+    std::printf("TIME batch, per MoE layer: 1 token %.1f us; 8 tokens mostly distinct (%d experts) %.1f us; "
+                "8 tokens shared (%d experts) %.1f us\n",
+                t_batch_one, n_distinct, t_batch_distinct, n_shared, t_batch_shared);
+  }
+
   // ---- Timing ----
   const double gu_bytes = kUsed * 2.0 * kFf * kHidden * 4.125 / 8.0;
   const double dn_bytes = kUsed * 1.0 * kHidden * kFf * 4.125 / 8.0;
-  hipEvent_t e0, e1;
-  HIP_OK(hipEventCreate(&e0));
-  HIP_OK(hipEventCreate(&e1));
   auto time_new = [&](bool plain, bool gu, bool dn, int* launches, bool sh = false) {
     for (int i = 0; i < 16; ++i)
       NewLayer(layers[i % n_layers], s, ids_all + (i % kSets) * kUsed, n_exp, st, false,
