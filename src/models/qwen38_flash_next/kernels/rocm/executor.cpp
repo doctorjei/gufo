@@ -2457,7 +2457,10 @@ bool Executor::HtDenseGroup(
 }
 
 bool Executor::WideHgn(const DeviceTensor& w, std::uint32_t n_tokens) const noexcept {
-  return wide_w16_ != nullptr && std::size_t{w.rows} * w.cols <= wide_w16_elems_ &&
+  // Up to 32 rows the decode kernels (8 rows a launch) beat decoding the
+  // matrix to f16 for one GEMM (measured: a 32-token prompt 125 -> 110 tok/s).
+  constexpr std::uint32_t kWideHgnMinRows = 33;
+  return n_tokens >= kWideHgnMinRows && wide_w16_ != nullptr && std::size_t{w.rows} * w.cols <= wide_w16_elems_ &&
          w.cols <= model_->max_half_cols() && n_tokens <= scratch_rows_ &&
          (w.type == GgmlType::kQ6G64 ||
           (w.type == GgmlType::kHT4 && w.su != nullptr && w.sv != nullptr &&
