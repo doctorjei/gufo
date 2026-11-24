@@ -23,6 +23,7 @@
 
 #include "src/core/platform/mapped_file.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/core/quant/hgn_decode.hpp"
 #include "src/core/rust/callback.hpp"
 
 namespace gufo::core {
@@ -409,6 +410,9 @@ bool GgufReader::ParseHeaders(std::string* error_msg, GgufOpenOptions options) {
                                std::uint64_t elements,
                                std::uint64_t first_dimension) noexcept {
     const auto ggml_type = static_cast<GgmlType>(type);
+    if (quant::IsHgnStore(ggml_type)) {
+      return quant::HgnEncodedSizeBytes(ggml_type, elements, first_dimension);
+    }
     const auto block = quant::QuantizedBlockElements(ggml_type);
     return block != 0 && first_dimension % block != 0
                ? std::size_t{0}

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <gufo/ext/gguf_reader.hpp>
 #include <limits>
 #include <optional>
@@ -137,10 +138,33 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   if (c.ple_layer >= 0) {
+    const core::GgufReader* table_reader = m->reader_.get();
+    if (!m->weights_->ple_table_file.empty()) {
+      // The trunk names a table GGUF; it must sit next to the trunk and be a
+      // plain file name (no directories).
+      const std::filesystem::path name(m->weights_->ple_table_file);
+      if (name.has_parent_path() || name.filename() != name) {
+        AssignError(error_msg, "qwen4exp.ple.table_file must be a file name");
+        return nullptr;
+      }
+      const auto path =
+          std::filesystem::path(model_path).parent_path() / name;
+      m->ple_reader_ = core::GgufReader::OpenFile(path.string(), error_msg);
+      if (!m->ple_reader_) {
+        return nullptr;
+      }
+      auto table = BindPleTable(*m->ple_reader_, c, error_msg);
+      if (!table) {
+        return nullptr;
+      }
+      m->weights_->ple_table = *table;
+      table_reader = m->ple_reader_.get();
+    }
     const auto& t = m->weights_->ple_table;
     m->ngram_ = NgramTable::Open(
-        m->reader_->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
-        t.rows, c.ple_head_dim, t.type, error_msg);
+        table_reader->GetMappedRegions()[t.shard].file_descriptor,
+        t.file_offset, t.rows, c.ple_head_dim, t.type, error_msg,
+        Fp8gTableScale(t));
     if (!m->ngram_) {
       return nullptr;
     }

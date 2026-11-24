@@ -47,6 +47,24 @@ enum class GgmlType : std::uint16_t {
   kI32 = 26,
   kIQ1_M = 29,
   kBF16 = 30,
+  // I4R128: rotated 4-bit offset-binary expert codes, 128 values per 66-byte
+  // block (4.125 bpw). The stored numbers are in a 128-point Hadamard-rotated
+  // basis, so decoding yields the stored values, not the true weight; see
+  // docs/internal/design/i4r128/RFC.md. The id sits well above upstream
+  // GGML_TYPE_COUNT so it cannot collide with future upstream types, and it
+  // appears only in the tensor-info field and the sizing switch -- never inside
+  // a payload -- so a later renumber is a two-line change.
+  kI4R128 = 64,
+  // Stores of halogen's published HGN checkpoints (public hgn-spec 1.1.0),
+  // kept byte for byte by tools/hgn2gguf. Layouts and size rules:
+  // tools/hgn2gguf/TYPES.md. Their row layouts are not GGML blocks, so they
+  // are sized by quant::HgnEncodedSizeBytes, which needs the row length.
+  kHT4 = 65,    ///< ht trellis, 4 bits, rotated (STORAGE.md "ht")
+  kHT3 = 66,    ///< ht trellis, 3 bits, rotated
+  kQ6G64 = 67,  ///< 6-bit affine, one f16 scale/bias pair per 64 values
+  kFP8G = 68,   ///< fp8 n-gram table with one global f32 scale
+  kQ4C = 69,    ///< 4-bit codes with a learned 16-level codebook (planar)
+  kQ8G64 = 70,  ///< 8-bit affine, one f16 scale/bias pair per 64 values
 };
 
 [[nodiscard]] constexpr std::string_view ToString(GgmlType type) noexcept {
@@ -101,6 +119,20 @@ enum class GgmlType : std::uint16_t {
       return "IQ1_M";
     case GgmlType::kBF16:
       return "BF16";
+    case GgmlType::kI4R128:
+      return "I4R128";
+    case GgmlType::kHT4:
+      return "HT4";
+    case GgmlType::kHT3:
+      return "HT3";
+    case GgmlType::kQ6G64:
+      return "Q6G64";
+    case GgmlType::kFP8G:
+      return "FP8G";
+    case GgmlType::kQ4C:
+      return "Q4C";
+    case GgmlType::kQ8G64:
+      return "Q8G64";
   }
   return "UNKNOWN";
 }

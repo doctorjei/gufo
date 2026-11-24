@@ -20,6 +20,10 @@ struct DeviceTensor {
   std::uint32_t cols{0};
   std::uint32_t rows{0};
   std::uint32_t experts{1};
+  /// kHT4 only: the input-side (`cols`) and output-side (`rows`) rotation
+  /// vectors, widened to F32 on upload.
+  const float* su{nullptr};
+  const float* sv{nullptr};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] const float* f32() const noexcept {
@@ -57,6 +61,21 @@ struct DeviceLayer {
   DeviceTensor router;
   DeviceTensor ffn_gate_exps, ffn_up_exps, ffn_down_exps, shexp_gate, shexp_up,
       shexp_down;
+  /// Rotated-expert (I4R128) scales, widened to F32 on upload. Present only
+  /// when the three expert tensors above are I4R128 and the layer bound its
+  /// rotation cleanly (`rotated` true). Widths follow the pairing table:
+  /// su_experts [hidden], sv_gate/sv_up [expert_ff], su_down [expert_ff],
+  /// sv_down [hidden].
+  bool rotated{false};
+  /// Rotated expert tensors were repacked at load into the split codes /
+  /// scales layout (i4r_fused.hpp) and run the batched device-routed
+  /// kernels. False keeps the GGUF 66-byte blocks and the unbatched path.
+  bool rot_split{false};
+  /// shexp_down (Q8_0) was repacked for the shared-expert range of the
+  /// batched gate+up launch. Only set together with rot_split; the stock
+  /// Q8_0 kernels must then not read shexp_down.
+  bool shexp_split{false};
+  DeviceTensor rot_su_experts, rot_sv_gate, rot_sv_up, rot_su_down, rot_sv_down;
   DeviceTensor nextn_enorm, nextn_hnorm, nextn_fc_embedding, nextn_fc_hidden;
   DeviceMixer nextn_head;
 };
@@ -112,9 +131,18 @@ public:
   std::span<const std::int32_t> draft_specials() const noexcept {
     return draft_specials_;
   }
-  /// Bytes of one output() row.
+  /// The row-addressable head the draft vocabulary reads: output() itself,
+  /// or, when output() is kHT4 (rows exist only as rotated 128-row bands), a
+  /// Q8_0 copy made at load. Drafts are verified by the full head, so the
+  /// copy steers acceptance only; greedy text is unchanged.
+  const DeviceTensor& draft_rows() const noexcept {
+    return draft_rows_.empty() ? output_ : draft_rows_;
+  }
+  /// Bytes of one draft_rows() row.
   std::size_t output_row_bytes() const noexcept {
-    return output_.rows == 0 ? 0 : output_bytes_ / output_.rows;
+    const DeviceTensor& t = draft_rows();
+    const std::size_t bytes = draft_rows_.empty() ? output_bytes_ : draft_rows_bytes_;
+    return t.rows == 0 ? 0 : bytes / t.rows;
   }
   /// Drafts score output() rows [0, prefix_rows) plus a per-session table
   /// that starts with `specials`. The rows of a Q8_0 head are requantized
@@ -148,6 +176,8 @@ private:
   DeviceTensor output_;
   std::size_t output_bytes_{0};
   DeviceTensor draft_output_;
+  DeviceTensor draft_rows_;
+  std::size_t draft_rows_bytes_{0};
   std::vector<std::int32_t> draft_specials_;
   DeviceMixer hc_head_;
   std::vector<DeviceLayer> layers_;

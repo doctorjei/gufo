@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "src/models/qwen38_flash_next/kernels/rocm/backend_geometry.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/gdn_geometry.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
@@ -1536,6 +1538,12 @@ __global__ void PleInjectKernel(float* res, const float* gated,
 /// packed [t][kh][d] buffers the recurrence streams from, so the serial loop
 /// carries no block-wide reductions. One wave per (token, head) row.
 constexpr unsigned kGdnDim = 128;
+// The host-side geometry contract must agree with the compile-time head
+// dimension the recurrence kernels are built around; see gdn_geometry.hpp.
+static_assert(kGdnDim == kGdnSupportedHeadDim,
+             "kGdnDim drifted from kGdnSupportedHeadDim in gdn_geometry.hpp; "
+             "the host-side GDN geometry checks would no longer describe this "
+             "kernel's addressing");
 template<bool kBatch>
 __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
                               std::uint32_t n_rows, std::uint32_t k_heads,
@@ -4144,6 +4152,27 @@ constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
 // index below its membership bits, which bounds the extent at 2^28 blocks.
 constexpr std::uint32_t kWmmaPassWords = 256 * 8;
 constexpr std::uint32_t kWmmaMemberShift = 28;
+
+// The host-side attention contract in backend_geometry.hpp must agree with
+// the geometry these kernels are built around: the pre-upload validator
+// and the driver's scope assertions describe THIS code, so a drift on
+// either side must fail at compile time, not silently mis-validate.
+static_assert(attn_contract::kWmmaQueryHeads == kWmmaQueryHeads,
+              "attn_contract::kWmmaQueryHeads drifted from kWmmaQueryHeads");
+static_assert(attn_contract::kWmmaKvHeads == kWmmaKvHeads,
+              "attn_contract::kWmmaKvHeads drifted from kWmmaKvHeads");
+static_assert(attn_contract::kWmmaHeadDim == kWmmaHeadDim,
+              "attn_contract::kWmmaHeadDim drifted from kWmmaHeadDim");
+static_assert(attn_contract::kWmmaRatio == kWmmaRatio,
+              "attn_contract::kWmmaRatio drifted from kWmmaRatio");
+// The fallback Attention() further down is written for 256-wide heads
+// (`if (d != 256) return;`) and launches only when
+// (heads / kv_heads) % 4 == 0; the contract constants must match those
+// literals.
+static_assert(attn_contract::kFallbackHeadDim == 256,
+              "attn_contract::kFallbackHeadDim must match the fallback's d == 256 gate");
+static_assert(attn_contract::kFallbackGroupMultiple == 4,
+              "attn_contract::kFallbackGroupMultiple must match the fallback's (heads / kv_heads) % 4 gate");
 
 /// Two row layouts share the kernel. The dense window packs 16 queries x 2
 /// heads (a row block is 16 queries of one head, grid.y over head pairs).
@@ -8641,6 +8670,12 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    __half* out_half, GdnCheckpoint checkpoint,
                    std::uint32_t out_half_stride, void* out_q8_1,
                    hipEvent_t z_ready) {
+  // The recurrence kernels below address state with the compile-time
+  // kGdnDim, never with this function's runtime `d`. A head dimension that
+  // differs makes them read and write past the state buffer the host sized
+  // from ssm_head_dim (4x at d=64), so reject it here, before any launch.
+  if (!GdnHeadDimSupported(d))
+    return false;
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   const bool saved_history = !convolved && kernel == kSsmConvTaps &&

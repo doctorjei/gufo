@@ -404,6 +404,9 @@ add_library(gufo_core STATIC
   src/core/quant/ggml_dequant.cpp
   src/core/quant/ggml_gemm.cpp
   src/core/audio.cpp
+  src/core/quant/i4r_rotation.cpp
+  src/core/quant/i4r_dispatch.cpp
+  src/core/quant/hgn_decode.cpp
 )
 target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(gufo_core PUBLIC gufo_platform gufo_npu ICU::uc ICU::i18n
@@ -430,10 +433,36 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 endif()
 
 if (ENGINE_ENABLE_HIP)
+  # i4r_kernels.hip.cpp carries a .cpp suffix but is device code. Without an
+  # explicit LANGUAGE it would be classified CXX and compiled with the host
+  # compiler, so the intended device object is never produced. LANGUAGE is a
+  # per-source property and is set here.
+  #
+  # The HIP language STANDARD is a TARGET property, NOT a source property:
+  # HIP_STANDARD / HIP_STANDARD_REQUIRED on set_source_files_properties are
+  # silently ignored (review-v5 blocker 2), so the previous per-source
+  # standard never actually applied to gufo_core. It is set on the gufo_core
+  # TARGET below instead. i4r_kernels.hip.cpp is the ONLY HIP-language TU in
+  # gufo_core, so the target property lands on exactly that TU and touches
+  # nothing else; the project's other .hip files live in gufo_cache_hip and
+  # gufo_diagnostics and keep their own standard. 20 matches the
+  # project-wide C++ standard.
+  set_source_files_properties(src/core/quant/i4r_kernels.hip.cpp
+    src/core/quant/i4r_fused_kernels.hip.cpp
+    src/core/quant/ht_dense_kernels.hip.cpp
+    src/core/quant/q6g64_dense_kernels.hip.cpp PROPERTIES
+    LANGUAGE HIP)
   target_sources(gufo_core PRIVATE
     src/core/hip/weight_upload.cpp
     src/core/speculative/speculative_verifier.cpp
+    src/core/quant/i4r_kernels.hip.cpp
+    src/core/quant/i4r_fused_kernels.hip.cpp
+    src/core/quant/ht_dense_kernels.hip.cpp
+    src/core/quant/q6g64_dense_kernels.hip.cpp
   )
+  set_target_properties(gufo_core PROPERTIES
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON)
   target_compile_definitions(gufo_core PUBLIC ENGINE_ENABLE_HIP=1)
   target_include_directories(gufo_core SYSTEM PRIVATE
     ${HIPCUB_INCLUDE_DIR}
@@ -1587,6 +1616,69 @@ endfunction()
   add_test(NAME ggml_gemm_parity_test COMMAND ggml_gemm_parity_test)
   set_tests_properties(ggml_gemm_parity_test PROPERTIES LABELS "cpu;core;quant")
 
+  add_executable(i4r128_reference_test tests/core/i4r128_reference_test.cpp)
+  target_link_libraries(i4r128_reference_test PRIVATE gufo_core)
+
+  add_test(NAME i4r128_reference_test COMMAND i4r128_reference_test)
+  set_tests_properties(i4r128_reference_test PROPERTIES LABELS "cpu;core;quant")
+
+  add_executable(hgn_decode_test tests/core/hgn_decode_test.cpp)
+  target_link_libraries(hgn_decode_test PRIVATE gufo_core)
+  add_test(NAME hgn_decode_test COMMAND hgn_decode_test)
+  set_tests_properties(hgn_decode_test PROPERTIES LABELS "cpu;core;quant")
+
+  # Host-emulation test: runs the GPU kernels' shared math on the CPU against
+  # the RotatedGemv / DequantizeI4R128 oracle. No GPU needed; guards the
+  # decode, FWHT and pipeline composition on every CPU build.
+  add_executable(i4r_hip_math_host_test tests/core/i4r_hip_math_host_test.cpp)
+  target_link_libraries(i4r_hip_math_host_test PRIVATE gufo_core)
+  add_test(NAME i4r_hip_math_host_test COMMAND i4r_hip_math_host_test)
+  set_tests_properties(i4r_hip_math_host_test PROPERTIES LABELS "cpu;core;quant")
+
+  # Host-side rotated-expert dispatch (option (a)): the stage order, scale
+  # pairing, expert-slot mapping and per-expert strides, checked against the
+  # RotatedGemv oracle with CPU stand-ins for the GPU primitives.
+  add_executable(i4r_dispatch_test tests/core/i4r_dispatch_test.cpp)
+  target_link_libraries(i4r_dispatch_test PRIVATE gufo_core)
+  add_test(NAME i4r_dispatch_test COMMAND i4r_dispatch_test)
+  set_tests_properties(i4r_dispatch_test PROPERTIES LABELS "cpu;core;quant")
+
+  # Shared stage scratch accounting. Pure arithmetic (no device), so the
+  # expert-dominant shape that the rotated path can overrun is checked on
+  # every CPU build rather than discovered on hardware.
+  add_executable(i4r_stage_budget_test tests/core/i4r_stage_budget_test.cpp)
+  target_link_libraries(i4r_stage_budget_test PRIVATE gufo_core)
+  add_test(NAME i4r_stage_budget_test COMMAND i4r_stage_budget_test)
+  set_tests_properties(i4r_stage_budget_test PROPERTIES LABELS "cpu;core;quant")
+
+  # The rotated-expert parity gate itself: thresholds, metric definition and
+  # the comparison invariants (size, both-sided finiteness, non-vacuous
+  # reference). Header-only and device-free, so the gate the GPU driver
+  # enforces gets executed evidence on every CPU build instead of
+  # compile-only evidence.
+  add_executable(i4r_parity_gate_test tests/core/i4r_parity_gate_test.cpp)
+  target_link_libraries(i4r_parity_gate_test PRIVATE gufo_core)
+  add_test(NAME i4r_parity_gate_test COMMAND i4r_parity_gate_test)
+  set_tests_properties(i4r_parity_gate_test PROPERTIES LABELS "cpu;core;quant")
+
+  # Host-side copy-bound regression for the rotated dispatch's input vs slot
+  # geometry (review-v5 blocker 1): pins that the input copy length is
+  # n_tokens*hidden, never the larger slots*hidden. Device-free.
+  add_executable(i4r_copy_bound_test tests/core/i4r_copy_bound_test.cpp)
+  target_link_libraries(i4r_copy_bound_test PRIVATE gufo_core)
+  add_test(NAME i4r_copy_bound_test COMMAND i4r_copy_bound_test)
+  set_tests_properties(i4r_copy_bound_test PROPERTIES LABELS "cpu;core;quant")
+
+  # GDN head-dimension contract (point-85 geometry correction): the
+  # recurrence kernels are compiled for a 128-wide head, so a reduced
+  # ssm_head_dim must be rejected before any launch rather than overrun the
+  # state buffers. Exercises the real host-side predicate the executor and
+  # the kernel wrapper call, plus the fixture's own geometry. Device-free.
+  add_executable(gdn_geometry_test tests/core/gdn_geometry_test.cpp)
+  target_link_libraries(gdn_geometry_test PRIVATE gufo_core)
+  add_test(NAME gdn_geometry_test COMMAND gdn_geometry_test)
+  set_tests_properties(gdn_geometry_test PROPERTIES LABELS "cpu;core;quant")
+
   add_executable(exact_token_test tests/quality/exact_token_test.cpp)
   target_link_libraries(exact_token_test PRIVATE gufo_core ${GUFO_QWEN_LIBRARIES})
   add_test(NAME exact_token_test COMMAND exact_token_test)
@@ -1922,6 +2014,27 @@ endfunction()
     set_tests_properties(hip_memory_visibility_driver_test PROPERTIES
       LABELS "gpu;hip;gfx1151"
       ENVIRONMENT "HSA_USERPTR_FOR_PAGED_MEM=0")
+
+    # I4R128 GPU kernels: rotate stages + MMVQ decode + MMQ prefill, checked
+    # against the CPU oracle on device. Skips (77) when no GPU is present.
+    # HIP_STANDARD 20 is required here: this TU includes ggml_dequant.hpp,
+    # whose declarations use std::span (C++20). The HIP language standard is
+    # set with HIP_STANDARD, not CXX_STANDARD.
+    add_executable(q6g64_dense_test EXCLUDE_FROM_ALL tests/core/q6g64_dense_test.hip)
+    set_target_properties(q6g64_dense_test PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+    target_link_libraries(q6g64_dense_test PRIVATE gufo_core hip::host)
+    add_executable(ht_dense_test EXCLUDE_FROM_ALL tests/core/ht_dense_test.hip)
+    set_target_properties(ht_dense_test PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+    target_link_libraries(ht_dense_test PRIVATE gufo_core hip::host)
+    add_executable(i4r_hip_test tests/models/qwen38_flash_next/i4r_hip_test.hip)
+    set_target_properties(i4r_hip_test PROPERTIES
+      HIP_STANDARD 20
+      HIP_STANDARD_REQUIRED ON)
+    target_link_libraries(i4r_hip_test PRIVATE gufo_core hip::host)
+    add_test(NAME i4r_hip_test COMMAND i4r_hip_test)
+    set_tests_properties(i4r_hip_test PROPERTIES
+      LABELS "gpu;hip;gfx1151;qwen38-flash-next"
+      SKIP_RETURN_CODE 77)
 
     add_executable(hip_weight_upload_test tests/core/hip_weight_upload_test.cpp)
     target_link_libraries(hip_weight_upload_test PRIVATE gufo_core)

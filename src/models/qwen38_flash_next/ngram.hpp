@@ -86,7 +86,7 @@ public:
   [[nodiscard]] static std::unique_ptr<NgramTable> Open(
       platform::PlatformFile file, std::uint64_t file_offset,
       std::uint64_t rows, std::uint32_t row_dim, core::GgmlType type,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr, float fp8_scale = 0.0f);
 
   /// Gathers `rows.size()` rows into `out` (rows.size() * row_dim floats).
   /// Duplicate ids are read once. Returns false on any failed read.
@@ -146,6 +146,8 @@ private:
   std::uint32_t row_dim_{0};
   std::size_t row_bytes_{0};
   core::GgmlType type_{core::GgmlType::kIQ4_NL};
+  /// kFP8G: value of each code times the table's global scale.
+  float fp8_lut_[256]{};
 
   // A small resident pool keeps decode-time reads from paying thread
   // creation; prefill batches fan out over the same workers.

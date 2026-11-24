@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <gufo/ext/gguf_reader.hpp>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -48,6 +49,19 @@ struct TensorRef {
   std::uint32_t shard{0};        ///< Mapped region index in the reader.
   std::string_view name;
 
+  /// `shard` of a tensor decoded on the host at bind time (an HGN store, see
+  /// src/core/quant/hgn_decode.hpp): `data` points at the decoded F16/F32
+  /// values, owned by the bound weights, and uploads copy from it instead of
+  /// reading the file.
+  static constexpr std::uint32_t kHostShard = 0xFFFFFFFFu;
+  /// kHT4 (read in place by the ht kernels): the F16 rotation vectors
+  /// `<name>_rot.su` [cols] and `<name>_rot.sv` [rows], mapped from the file.
+  const void* rot_su{nullptr};
+  const void* rot_sv{nullptr};
+  [[nodiscard]] bool HostDecoded() const noexcept {
+    return shard == kHostShard;
+  }
+
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] std::uint64_t ElementCount() const noexcept {
     return cols * rows * experts;
@@ -71,6 +85,35 @@ struct HcMixer {
   TensorRef up;      ///< [low_rank -> hc_dim]
   TensorRef inject;  ///< [hc_dim -> hc_count], empty on the head mixer.
 };
+
+/// The five F16 rotation vectors a rotated (I4R128) expert layer carries,
+/// resolved through the pairing table of I4R-GGUF-SPEC.md section 5:
+///
+///   gate_exps <- ffn_experts_rot.su     [hidden]  + ffn_gate_exps_rot.sv [ff]
+///   up_exps   <- ffn_experts_rot.su     [hidden]  + ffn_up_exps_rot.sv   [ff]
+///   down_exps <- ffn_down_exps_rot.su   [ff]      + ffn_down_exps_rot.sv
+///   [hidden]
+///
+/// Gate and up share one input vector, which is why the layer carries five
+/// vectors rather than six. `rotated` is set only when all three expert
+/// tensors are I4R128 and every vector bound cleanly; a layer that is only
+/// partly rotated is a load error, never a silent mix.
+struct LayerRotation {
+  bool rotated{false};
+  TensorRef su_experts;  ///< [hidden] shared gate/up input scale
+  TensorRef sv_gate;     ///< [expert_ff] gate output scale
+  TensorRef sv_up;       ///< [expert_ff] up output scale
+  TensorRef su_down;     ///< [expert_ff] down input scale
+  TensorRef sv_down;     ///< [hidden] down output scale
+};
+
+/// Global GGUF marker naming the rotation applied to I4R128 codes
+/// (I4R-GGUF-SPEC.md section 6). A file that carries rotated codes must
+/// carry this marker with this exact value; a loader must never fall back to
+/// reading rotated codes as plain.
+inline constexpr std::string_view kRotationMarkerKey =
+    "qwen4exp.experts.rotation";
+inline constexpr std::string_view kRotationMarkerValue = "hadamard128";
 
 struct LayerWeights {
   bool linear{false};
@@ -109,10 +152,12 @@ struct LayerWeights {
   TensorRef ple_conv1d;      ///< [conv_kernel, hc_dim]
 
   // Mixture of experts.
-  TensorRef router;          ///< [hidden -> num_experts] F32
-  TensorRef ffn_gate_exps;   ///< [hidden -> expert_ff] x experts
-  TensorRef ffn_up_exps;     ///< [hidden -> expert_ff] x experts
-  TensorRef ffn_down_exps;   ///< [expert_ff -> hidden] x experts
+  TensorRef router;         ///< [hidden -> num_experts] F32
+  TensorRef ffn_gate_exps;  ///< [hidden -> expert_ff] x experts
+  TensorRef ffn_up_exps;    ///< [hidden -> expert_ff] x experts
+  TensorRef ffn_down_exps;  ///< [expert_ff -> hidden] x experts
+  /// Rotation vectors when the three tensors above are I4R128.
+  LayerRotation rotation;
   TensorRef shexp_gate_inp;  ///< [hidden] -> scalar sigmoid gate
   TensorRef shexp_gate;      ///< [hidden -> shared_ff]
   TensorRef shexp_up;        ///< [hidden -> shared_ff]
@@ -131,12 +176,27 @@ struct ModelWeights {
   TensorRef output;      ///< [hidden -> vocab]
   HcMixer hc_head;       ///< Final mixer, doubles as the output norm.
   TensorRef ple_table;   ///< [ple_head_dim, ple_rows], read from disk only.
+  /// Set when the trunk keeps its n-gram table in a separate GGUF next to it
+  /// (metadata qwen4exp.ple.table_file); ple_table is then bound by the
+  /// caller from that file with BindPleTable.
+  std::string ple_table_file;
   std::vector<LayerWeights> layers;
+  /// Host buffers of tensors decoded at bind time (TensorRef::kHostShard).
+  std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> decoded;
 
   /// Binds and validates the trunk artifact. Tensor payloads stay mapped and
   /// untouched; only headers are read.
   [[nodiscard]] static std::optional<ModelWeights> Bind(
       const core::GgufReader& reader, std::string* error_msg = nullptr);
+
+  /// Binds against a caller-supplied configuration, skipping the production
+  /// geometry gate that `Bind` applies through `Config::FromGguf`. This exists
+  /// so the CPU-oracle tests can bind fixtures that use the real tensor
+  /// layout at reduced dimensions; production loads always go through
+  /// `Bind`, which keeps the gate.
+  [[nodiscard]] static std::optional<ModelWeights> BindWithConfig(
+      const core::GgufReader& reader, const Config& config,
+      std::string* error_msg = nullptr);
 };
 
 /// The MTP draft block from the `shared-*` sidecar: one attention layer with
@@ -145,11 +205,21 @@ struct ModelWeights {
 struct MtpWeights {
   Config config;
   LayerWeights block;
+  std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> decoded;
 
   [[nodiscard]] static std::optional<MtpWeights> Bind(
       const core::GgufReader& reader, const Config& trunk,
       std::string* error_msg = nullptr);
 };
+
+/// Binds the n-gram (PLE) table of a trunk with configuration `c` from
+/// `reader`: the trunk itself, or the separate table GGUF it names.
+[[nodiscard]] std::optional<TensorRef> BindPleTable(
+    const core::GgufReader& reader, const Config& c,
+    std::string* error_msg = nullptr);
+
+/// Global scale of an FP8G n-gram table (the f32 after its codes).
+[[nodiscard]] float Fp8gTableScale(const TensorRef& table) noexcept;
 
 /// Hyper-connection inject and GDN alpha/beta tensors of `layer` stored as
 /// Q8_0. The official trunk GGUF keeps them in F32; the device expands Q8_0

@@ -34,6 +34,10 @@ add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
 # (like ngram) this stays out of cmake/Checks.cmake's hosted check-pr set.
 add_qwen38_flash_next_test(rope_scaling_oracle
   gufo_qwen38_flash_next_reference "cpu")
+# Point 85: I4R128 rotated-expert loader contract and the CPU-oracle parity
+# of the rotated MoE path against a materialized dense reference.
+add_qwen38_flash_next_test(i4r_loader gufo_qwen38_flash_next_reference "cpu")
+add_qwen38_flash_next_test(i4r_moe_parity gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
@@ -51,6 +55,48 @@ if (ENGINE_ENABLE_HIP)
       select_ops snapshot_copy verification_sampling wide_verification)
     add_qwen38_flash_next_test(${name} qwen38_flash_next_test_hip "hip;gpu;gfx1151")
   endforeach()
+  # Point 85 step 2: the real-executor rotated-path parity driver. This is
+  # the compile+link proof requested in review-v5 blocker 2 -- a real
+  # executable target with the full dependency closure (executor + device
+  # model + mmq kernels + CPU reference oracle + gufo core) and HIP 20, not
+  # a `-c` object-only compile. It is EXCLUDE_FROM_ALL so routine builds
+  # neither compile nor run it; select it explicitly with
+  #   cmake --build --preset <cfg> --target i4r_executor_parity_test
+  # CTest registration is a separate, explicit opt-in (review-v6): labels
+  # carry no exclusion semantics -- gpu-full has no filter and gpu-fast
+  # excludes only slow|external-model -- so an unconditional add_test would
+  # let ordinary GPU presets select this individually-approved
+  # qualification (or fail Not Run on the absent executable). The build
+  # target stays selectable in every configuration; the test is registered
+  # only when GUFO_I4R_PARITY_CTEST is ON. The driver still self-skips
+  # (return 77) with no device; SKIP_RETURN_CODE only maps a reported
+  # no-device exit to skip, it does not gate selection.
+  option(GUFO_I4R_PARITY_CTEST
+    "Register qwen38_flash_next.i4r_executor_parity with CTest. Default OFF: the individually approved qualification worker builds the target and runs the exact binary directly; enable only in a dedicated qualification configuration" OFF)
+  add_executable(i4r_executor_parity_test EXCLUDE_FROM_ALL
+    i4r_executor_parity_test.hip)
+  set_target_properties(i4r_executor_parity_test PROPERTIES
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON)
+  target_link_libraries(i4r_executor_parity_test PRIVATE
+    qwen38_flash_next_test_hip
+    gufo_qwen38_flash_next_reference
+    gufo_core)
+  # Batched i4r MoE decode: microbenchmark plus real-geometry cross-check
+  # against the unbatched dispatch. Manual only; needs a GPU.
+  add_executable(i4r_fused_bench EXCLUDE_FROM_ALL i4r_fused_bench.hip)
+  set_target_properties(i4r_fused_bench PROPERTIES
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON)
+  target_link_libraries(i4r_fused_bench PRIVATE gufo_core hip::host)
+  if (GUFO_I4R_PARITY_CTEST)
+    add_test(NAME qwen38_flash_next.i4r_executor_parity
+      COMMAND i4r_executor_parity_test)
+    set_tests_properties(qwen38_flash_next.i4r_executor_parity PROPERTIES
+      LABELS "qwen38_flash_next;hip;gpu;gfx1151;i4r;manual"
+      SKIP_RETURN_CODE 77
+      RUN_SERIAL TRUE)
+  endif()
   # Reuse the synthetic model fixture, with short prompts around a reduced
   # sparse budget. This exercises actual Executor capture/replay without GGUFs.
   add_test(NAME qwen38_flash_next.decode_graph

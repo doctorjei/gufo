@@ -117,22 +117,37 @@ NgramTable::~NgramTable() {
 
 std::unique_ptr<NgramTable> NgramTable::Open(
     platform::PlatformFile file, std::uint64_t file_offset, std::uint64_t rows,
-    std::uint32_t row_dim, core::GgmlType type, std::string* error_msg) {
+    std::uint32_t row_dim, core::GgmlType type, std::string* error_msg,
+    float fp8_scale) {
   std::unique_ptr<NgramTable> t(new NgramTable());
   const bool blocked =
       type == core::GgmlType::kIQ4_NL || type == core::GgmlType::kQ8_0;
+  const bool fp8 = type == core::GgmlType::kFP8G;
   const std::size_t block = blocked ? 32 : 1;
   const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18
                                   : type == core::GgmlType::kQ8_0 ? 34
-                                                                  : 2;
-  if ((!blocked && type != core::GgmlType::kBF16) || row_dim == 0 ||
-      row_dim % block != 0) {
+                                  : fp8                            ? 1
+                                                                   : 2;
+  if ((!blocked && !fp8 && type != core::GgmlType::kBF16) || row_dim == 0 ||
+      row_dim % block != 0 || (fp8 && !(fp8_scale > 0.0f))) {
     if (error_msg != nullptr) {
       *error_msg = "unsupported n-gram table format";
     }
     return nullptr;
   }
   t->type_ = type;
+  if (fp8) {
+    // hgn-spec STORAGE.md "The fp8 encoding": sign, 4-bit exponent (bias 7),
+    // 3-bit mantissa; no infinity or NaN (0x7F is 480).
+    for (unsigned c = 0; c < 256; ++c) {
+      const unsigned e = (c >> 3) & 0xFu;
+      const unsigned m = c & 7u;
+      const float v = e == 0 ? static_cast<float>(m) / 512.0f
+                             : (1.0f + static_cast<float>(m) / 8.0f) *
+                                   static_cast<float>(1u << e) / 128.0f;
+      t->fp8_lut_[c] = ((c & 0x80u) != 0 ? -v : v) * fp8_scale;
+    }
+  }
   t->row_dim_ = row_dim;
   t->row_bytes_ = row_dim / block * block_bytes;
   t->cache_count_ = std::bit_floor(kCacheBytes / t->row_bytes_);
@@ -161,7 +176,11 @@ std::unique_ptr<NgramTable> NgramTable::Open(
 }
 
 void NgramTable::DecodeRow(const std::uint8_t* src, float* dst) const {
-  if (type_ == core::GgmlType::kIQ4_NL) {
+  if (type_ == core::GgmlType::kFP8G) {
+    for (std::uint32_t i = 0; i < row_dim_; ++i) {
+      dst[i] = fp8_lut_[src[i]];
+    }
+  } else if (type_ == core::GgmlType::kIQ4_NL) {
     gufo::quant::DequantizeIQ4_NL(src, dst, row_dim_);
   } else if (type_ == core::GgmlType::kQ8_0) {
     gufo::quant::DequantizeQ8_0(src, dst, row_dim_);

@@ -51,6 +51,12 @@ public:
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   void Reset();
 
+  /// Routed + shared expert block for one token, exposed so the CPU-oracle
+  /// parity test can drive it directly against a materialized-weight
+  /// reference. The model's own entry point is `Step`.
+  void Moe(const LayerWeights& l, std::span<const float> x,
+           std::span<float> out);
+
 private:
   void MatVec(const TensorRef& weight, std::uint64_t expert,
               std::span<const float> x, std::span<float> out,
@@ -79,8 +85,6 @@ private:
                  std::span<const float> x, std::uint32_t pos,
                  std::span<float> out,
                  const qwen::vision::RopeLayout* rope = nullptr);
-  void Moe(const LayerWeights& l, std::span<const float> x,
-           std::span<float> out);
 
   const ModelWeights& w_;
   const Config& c_;

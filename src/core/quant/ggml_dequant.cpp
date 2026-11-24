@@ -9,6 +9,8 @@
 #include <cstring>
 #include <limits>
 
+#include "src/core/quant/i4r_rotation.hpp"
+
 namespace gufo::quant {
 
 // Standard half-precision float to single-precision float conversion
@@ -234,6 +236,9 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
       break;
     case core::GgmlType::kIQ3_S:
       block_bytes = sizeof(block_iq3_s);
+      break;
+    case core::GgmlType::kI4R128:
+      block_bytes = sizeof(block_i4r128);
       break;
     default:
       return 0;
@@ -1044,6 +1049,56 @@ void DequantizeIQ1_M(const void* src, float* dst, std::size_t k) {
   }
 }
 
+// I4R128 decode. Yields the rotated stored numbers M, not the true weight W;
+// see block_i4r128 in the header. Nibble order is the GGUF convention: for
+// block byte b, the low nibble is value b and the high nibble is value 64 + b,
+// so a kernel unpacks with the same pattern it uses for Q4_0 / Q4_K.
+void DequantizeI4R128(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_i4r128*>(src);
+  const std::size_t nb = k / kI4rBlock;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = Fp16ToFloat(
+        LoadU16(reinterpret_cast<const std::uint8_t*>(&blocks[b]) + 64));
+    const std::uint8_t* codes = blocks[b].codes;
+    float* out = dst + b * kI4rBlock;
+    for (std::size_t i = 0; i < 64; ++i) {
+      const std::uint8_t byte = codes[i];
+      // Signed on purpose: `byte & 0x0FU` promotes to *unsigned* int, so
+      // subtracting 8 there wraps to ~2^32 instead of going negative.
+      const int lo = static_cast<int>(byte & 0x0FU) - 8;
+      const int hi = static_cast<int>(byte >> 4U) - 8;
+      out[i] = static_cast<float>(lo) * d;
+      out[64 + i] = static_cast<float>(hi) * d;
+    }
+  }
+}
+
+float DotProductI4R128(const void* row_data, std::span<const float> vec,
+                       std::size_t k) {
+  const auto* blocks = static_cast<const block_i4r128*>(row_data);
+  const std::size_t nb = k / kI4rBlock;
+  double total = 0.0;
+  for (std::size_t b = 0; b < nb; ++b) {
+    // Each block carries its own scale, so it factors out of that block's dot
+    // product only -- it cannot be applied once across the whole row.
+    const float d = Fp16ToFloat(
+        LoadU16(reinterpret_cast<const std::uint8_t*>(&blocks[b]) + 64));
+    const std::uint8_t* codes = blocks[b].codes;
+    const float* v = vec.data() + b * kI4rBlock;
+    double part = 0.0;
+    for (std::size_t i = 0; i < 64; ++i) {
+      const std::uint8_t byte = codes[i];
+      // Signed on purpose; see DequantizeI4R128.
+      const int lo = static_cast<int>(byte & 0x0FU) - 8;
+      const int hi = static_cast<int>(byte >> 4U) - 8;
+      part += static_cast<double>(lo) * v[i];
+      part += static_cast<double>(hi) * v[64 + i];
+    }
+    total += part * d;
+  }
+  return static_cast<float>(total);
+}
+
 bool DequantizeRow(core::GgmlType type, const void* src, float* dst,
                    std::size_t k) {
   const auto* bytes = static_cast<const std::uint8_t*>(src);
@@ -1129,6 +1184,9 @@ bool DequantizeRow(core::GgmlType type, const void* src, float* dst,
       return true;
     case core::GgmlType::kIQ4_XS:
       DequantizeIQ4_XS(src, dst, k);
+      return true;
+    case core::GgmlType::kI4R128:
+      DequantizeI4R128(src, dst, k);
       return true;
     default:
       return false;

@@ -151,6 +151,8 @@ private:
   ModelOptions options_;
   std::shared_ptr<core::GgufReader> reader_;
   std::shared_ptr<core::GgufReader> mtp_reader_;
+  /// The separate n-gram table GGUF a trunk may name (qwen4exp.ple.table_file).
+  std::shared_ptr<core::GgufReader> ple_reader_;
   std::unique_ptr<ModelWeights> weights_;
   std::unique_ptr<MtpWeights> mtp_weights_;
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;

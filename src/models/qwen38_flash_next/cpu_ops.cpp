@@ -77,6 +77,12 @@ void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
     case GgmlType::kQ6_K:
       gufo::quant::DequantizeQ6_K(src, out, k);
       break;
+    case GgmlType::kI4R128:
+      // Decodes the stored rotated-basis numbers M. The rotation stages are
+      // the caller's job (see i4r_rotation.hpp); decoding alone must never
+      // be mistaken for the true weight.
+      gufo::quant::DequantizeI4R128(src, out, k);
+      break;
     default:
       std::memset(out, 0, k * sizeof(float));
       break;

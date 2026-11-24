@@ -23,9 +23,12 @@ bool ProbeFlashNextGguf(const core::GgufReader& reader) {
   const auto trunk_layers = *block_count - nextn_layers;
   // Check only canonical weights bound by ModelWeights::Bind. Appended MTP
   // layers and unrelated tensors are not loaded as part of the trunk.
-  static constexpr std::array<core::GgmlType, 5> kExpertFormats = {
+  // I4R128 (rotated int4) experts are admitted here; ModelWeights::Bind
+  // enforces the rotation marker, whole-layer rotation and the rotation
+  // vectors, so a malformed rotated file still fails at load.
+  static constexpr std::array<core::GgmlType, 6> kExpertFormats = {
       core::GgmlType::kQ4_K, core::GgmlType::kQ5_K, core::GgmlType::kQ6_K,
-      core::GgmlType::kQ5_1, core::GgmlType::kQ8_0};
+      core::GgmlType::kQ5_1, core::GgmlType::kQ8_0, core::GgmlType::kI4R128};
   for (const auto& tensor : reader.GetTensors()) {
     auto name = tensor.name;
     if (!name.starts_with("blk.")) {

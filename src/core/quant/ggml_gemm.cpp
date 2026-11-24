@@ -24,6 +24,7 @@ bool IsQuantized(core::GgmlType type) noexcept {
     case core::GgmlType::kQ6_K:
     case core::GgmlType::kQ8_K:
     case core::GgmlType::kQ8_0:
+    case core::GgmlType::kI4R128:
       return true;
     default:
       return false;
@@ -75,6 +76,11 @@ void Dequantize(core::GgmlType type, const void* src, float* dst,
     case core::GgmlType::kQ8_0:
       DequantizeQ8_0(src, dst, k);
       return;
+    case core::GgmlType::kI4R128:
+      // Yields the rotated stored numbers M. Callers that need the true weight
+      // must apply the rotation stages (i4r_rotation.hpp).
+      DequantizeI4R128(src, dst, k);
+      return;
     default:
       assert(false && "quant::Dequantize: unsupported GgmlType");
       std::abort();
@@ -120,6 +126,11 @@ float Dot(core::GgmlType type, const void* row, std::span<const float> x,
       return DotProductQ8_K(row, x, k);
     case core::GgmlType::kQ8_0:
       return DotProductQ8_0(row, x, k);
+    case core::GgmlType::kI4R128:
+      // Dot against the rotated stored numbers, not the true weight. A correct
+      // rotated expert matvec needs the su/Hn pre-rotation and the Hn/sv
+      // post-rotation; see quant::RotatedGemv.
+      return DotProductI4R128(row, x, k);
     default:
       assert(false && "quant::Dot: unsupported GgmlType");
       std::abort();

@@ -789,7 +789,8 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
-  if (rows <= kDecodeRows)
+  if (rows <= kDecodeRows || w.type == core::GgmlType::kHT4 ||
+      w.type == core::GgmlType::kQ6G64)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,

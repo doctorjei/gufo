@@ -666,6 +666,17 @@ private:
              std::string* error_msg) const;
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
+  /// y = W x for a kHT4 matrix read in place (ht_dense.hpp), in launches of
+  /// up to eight token rows.
+  bool HtDense(const DeviceTensor& w, const float* x, float* out,
+               std::uint32_t n_tokens, std::string* error_msg) const;
+  /// One ht launch for several kHT4 matrices that read the same input x
+  /// (each writes its own `out`), in launches of up to eight token rows.
+  bool HtDenseGroup(
+      std::initializer_list<std::pair<const DeviceTensor*, float*>> parts,
+      const float* x, std::uint32_t n_tokens, std::string* error_msg) const;
+  /// True when every tensor is kHT4 with the same input width.
+  static bool AllHt(std::initializer_list<const DeviceTensor*> parts) noexcept;
   /// out = (up . x) * silu(gate . x); s_.shexp_gate is scratch.
   /// With `down` (the projection that consumes the result), a wide batch
   /// leaves only that projection's staged input form (F16 rows in
@@ -920,6 +931,18 @@ private:
     float* gate_e;
     float* up_e;
     float* down_e;
+    /// Rotated (I4R128) path: the layer-hoisted rotated input [T x hidden]
+    /// plus the out-of-place rotation temps. The accepted rotate kernel
+    /// declares its input/output `__restrict__`, so each stage rotates into
+    /// a distinct buffer instead of in place. Sizes: x_rot [T x hidden],
+    /// rot_gate_pre / rot_up_pre / rot_down_in [expert_ff] each,
+    /// rot_down_pre [hidden]. The temps are reused across the slot loop.
+    /// See gufo::quant::RotatedScratchFloats.
+    float* x_rot;
+    float* rot_gate_pre;
+    float* rot_up_pre;
+    float* rot_down_in;
+    float* rot_down_pre;
     float* shexp_gate;
     float* shexp_up;
     float* shexp_out;
@@ -1035,6 +1058,33 @@ private:
   }
   bool dynamic_yarn_{false};
   RopeScaling yarn_max_{};  ///< configured static scaling (dynamic ceiling)
+  /// True when any loaded layer bound a rotated (I4R128) expert rotation.
+  /// Rotated dispatch selects expert weights in a host loop, so its kernel
+  /// arguments are CPU-chosen per pass and must never be captured into a
+  /// graph. Forward forces the eager route for the whole executor when this
+  /// is set; MoeExperts keeps its capture-refusal guard as defense in
+  /// depth. Set once in Create from the loaded weights.
+  bool rotated_experts_{false};
+  /// True when a rotated layer still uses the host-routed unbatched
+  /// dispatch (its geometry has no batched instantiation). Only those force
+  /// the eager route; repacked layers read ids on the device.
+  bool host_routed_experts_{false};
+  /// Arrival counters of the batched rotated kernels (zeroed, self-reset).
+  unsigned* rot_counters_up_{nullptr};
+  unsigned* rot_counters_down_{nullptr};
+  unsigned* rot_counters_shared_{nullptr};
+  /// ht kernel scratch: cross-workgroup partial sums and per-band arrival
+  /// counters (zeroed; each finishing workgroup resets its counter).
+  float* ht_partials_{nullptr};
+  unsigned* ht_counters_{nullptr};
+  std::size_t ht_partial_floats_{0};
+  std::size_t ht_counter_count_{0};
+  std::uint32_t rot_counter_tokens_{0};
+  /// Plain f16 input for the batched rotated kernels (GUFO_I4R_PLAIN_F16=1).
+  bool rot_plain_f16_{false};
+  /// TEST-ONLY: the batched down launch also leaves each slot's unweighted
+  /// rotated output in s_.down_e (the unbatched path's layout).
+  mutable bool rot_per_slot_for_test_{false};
   /// Bounded score scratch, shared by sequential selector chunks.
   std::size_t select_score_floats_{0};
   std::vector<void*> allocations_;
@@ -1068,6 +1118,13 @@ private:
   Session::Control* control_host_{nullptr};
   std::int32_t* tokens_host_{nullptr};
   std::uint32_t* counts_host_{nullptr};
+  /// Pinned host staging for the rotated (I4R128) dispatch, which selects
+  /// each slot's expert weight pointer on the host. s_.ids is written by
+  /// RouterTopK on the device stream and may live in hipMalloc memory, so
+  /// the dispatch reads this copy instead: downloaded after the router and
+  /// read only once the stream has been synchronized, which makes it both
+  /// host-readable and fresh. Sized to max_batch * num_experts_used.
+  std::int32_t* ids_host_{nullptr};
   std::int32_t* tiles_host_{nullptr};           ///< routed tile map staging
   mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
   mutable std::uint32_t routed_n_tiles_{0};     ///< routed_tile_rows_ tiles
@@ -1141,6 +1198,18 @@ private:
   bool RunLayerHook(Session& session, std::string* error_msg) const;
   void* hc_fused_state_{nullptr};  ///< HcMixQ8Fused's counters (zeroed)
 };
+
+/// Forces this thread's prefill phase and returns the previous value.
+///
+/// TEST-ONLY. Production sets the phase inside `Executor::Forward` through a
+/// scoped RAII guard; nothing outside this translation unit needs to set it,
+/// and no production path calls this. It exists because the rotated-expert
+/// parity driver must exercise the prefill-phase expert dispatch -- the GEMM
+/// primitive with its token-row input stride -- at the isolated
+/// `MoeExperts` seam with caller-controlled expert ids, which `Forward`
+/// cannot reach without also replacing the router. Callers must restore the
+/// returned value; the driver wraps both calls in a scope guard.
+bool SetPrefillPhaseForTest(bool enabled);
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 

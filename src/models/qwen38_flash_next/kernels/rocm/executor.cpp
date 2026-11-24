@@ -25,8 +25,15 @@
 #include <vector>
 
 #include "qfn_mmq.h"
+#include "src/core/quant/i4r_dispatch.hpp"
+#include "src/core/quant/i4r_fused.hpp"
+#include "src/core/quant/ht_dense.hpp"
+#include "src/core/quant/q6g64_dense.hpp"
+#include "src/core/quant/i4r_launch.hpp"
 #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/gdn_geometry.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/stage_budget.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -177,6 +184,16 @@ void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
 }
 
 }  // namespace
+
+/// TEST-ONLY: see the declaration in executor.hpp. Production sets the phase
+/// through the scoped `PrefillPhase` guard inside Forward; this exposes the
+/// same thread-local so the rotated-expert parity driver can run the
+/// prefill-phase dispatch at the isolated MoeExperts seam.
+bool SetPrefillPhaseForTest(bool enabled) {
+  const bool previous = prefill_phase;
+  prefill_phase = enabled;
+  return previous;
+}
 
 namespace {
 constexpr std::uint64_t kSnapshotReuseBytes = 8ULL << 20;
@@ -1115,6 +1132,77 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->hc_fused_state_ =
       Alloc<std::uint8_t>(a, HcMixQ8FusedStateBytes(), error_msg);
   e->mask_words_ = c.SparseMaskWords(e->context_capacity_);
+  // The rotated (I4R128) path adds its own stage scratch on top of the
+  // plain expert term (see CarveRowScratch). Detect it from the loaded
+  // weights, not from scratch pointers, so the budget and the dispatch agree
+  // by construction. CarveRowScratch reads rotated_experts_, so set it first.
+  bool any_rotated = false;
+  bool any_host_routed = false;
+  bool any_split = false;
+  const auto note_layer = [&](const DeviceLayer& layer) {
+    any_rotated = any_rotated || layer.rotated;
+    any_host_routed = any_host_routed || (layer.rotated && !layer.rot_split);
+    any_split = any_split || layer.rot_split;
+  };
+  for (const auto& layer : model.layers()) note_layer(layer);
+  if (model.has_mtp()) note_layer(model.mtp());
+  e->rotated_experts_ = any_rotated;
+  e->host_routed_experts_ = any_host_routed;
+  if (any_split) {
+    // Arrival counters for the batched rotated kernels: gate+up uses one
+    // per (slot, 128-row ff tile), down one per (token, 128-row output
+    // tile). Zeroed here; each last arriver resets its own counter.
+    e->rot_counters_up_ = Alloc<unsigned>(
+        a, slots * (c.expert_ff / 128), error_msg);
+    e->rot_counters_down_ = Alloc<unsigned>(
+        a, std::size_t{T} * (hidden / 128), error_msg);
+    e->rot_counters_shared_ = Alloc<unsigned>(
+        a, std::size_t{T} * (hidden / 128), error_msg);
+    if (e->rot_counters_up_ == nullptr || e->rot_counters_down_ == nullptr ||
+        e->rot_counters_shared_ == nullptr)
+      return nullptr;
+    e->rot_counter_tokens_ = static_cast<std::uint32_t>(T);
+    // EXPERIMENTAL: GUFO_I4R_PLAIN_F16=1 stages the batched kernels' input
+    // as plain f16 (the spec variant) instead of the f16 hi/lo split. Faster,
+    // but ~4e-4 of peak against the f32 path, outside the 1e-4 parity gate.
+    if (const char* v = std::getenv("GUFO_I4R_PLAIN_F16"); v != nullptr && v[0] == '1')
+      e->rot_plain_f16_ = true;
+  }
+  {
+    // Scratch for the ht kernels, sized from every kHT4 matrix the model
+    // uploaded (the partials of one launch; launches run in stream order).
+    // A grouped launch covers matrices of one layer, so a layer's sum over
+    // all its ht matrices bounds every launch.
+    std::size_t partials = 0, counters = 0;
+    const auto sum_ht = [&](std::initializer_list<const DeviceTensor*> ts) {
+      std::size_t p = 0, n = 0;
+      for (const DeviceTensor* t : ts) {
+        if (t->empty() || t->type != GgmlType::kHT4) continue;
+        p += ht_dense_partial_floats(static_cast<int>(t->rows),
+                                     static_cast<int>(t->cols));
+        n += t->rows / 128;
+      }
+      partials = std::max(partials, p);
+      counters = std::max(counters, n);
+    };
+    const auto note_ht_layer = [&](const DeviceLayer& l) {
+      sum_ht({&l.ssm_qkv, &l.ssm_gate, &l.ssm_out, &l.attn_q, &l.attn_k,
+              &l.attn_v, &l.attn_out, &l.indexer_q, &l.indexer_k,
+              &l.shexp_gate, &l.shexp_up, &l.shexp_down, &l.ple_key,
+              &l.ple_value, &l.nextn_fc_embedding, &l.nextn_fc_hidden});
+    };
+    for (const auto& layer : model.layers()) note_ht_layer(layer);
+    if (model.has_mtp()) note_ht_layer(model.mtp());
+    sum_ht({&model.output()});
+    if (counters > 0) {
+      e->ht_partials_ = Alloc<float>(a, std::max<std::size_t>(partials, 1), error_msg);
+      e->ht_counters_ = Alloc<unsigned>(a, counters, error_msg);
+      if (e->ht_partials_ == nullptr || e->ht_counters_ == nullptr)
+        return nullptr;
+      e->ht_partial_floats_ = partials;
+      e->ht_counter_count_ = counters;
+    }
+  }
   // Keep score/selection traffic near the device cache size. Captured
   // verification still needs all its rows at the maximum context.
   const std::size_t score_stride = std::size_t{e->mask_words_} * 32;
@@ -1186,6 +1274,18 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
+    if (any_rotated) {
+      // Pinned staging for the rotated dispatch's host-side expert select.
+      // Sized for the widest batch the session can run.
+      void* ids = nullptr;
+      if (!Check(e->host_allocations_.Allocate(
+                     &ids, static_cast<std::size_t>(T) * c.num_experts_used *
+                               sizeof(std::int32_t)),
+                 "pinned rotated expert ids", error_msg)) {
+        return nullptr;
+      }
+      e->ids_host_ = static_cast<std::int32_t*>(ids);
+    }
     void* tiles = nullptr;
     if (!Check(e->host_allocations_.Allocate(
                    &tiles,
@@ -1321,17 +1421,30 @@ bool Executor::CarveRowScratch(
       T *
       (5 * c.AttentionQDim() + 4 * c.AttentionKvDim() +
        c.indexer_heads * c.indexer_head_dim + c.indexer_head_dim + mask_words_);
-  const std::size_t expert_floats = slots * (2 * c.expert_ff + hidden);
+  // The slices and the reservation come from one layout function, so the
+  // expert stage cannot be under-counted while the takes still add up. The
+  // rotated (I4R128) path adds the hoisted rotated input and four
+  // out-of-place rotation temps to the plain expert term.
+  const auto expert_stage = rocm::ExpertStageLayout(
+      slots, c.expert_ff, hidden, rotated_experts_, T);
+  const std::size_t expert_floats = expert_stage.Total();
   // Linear/full attention and routed experts run sequentially on stream_.
   // Their intermediates die before the next stage, including batched rows,
   // MTP catch-up and the deferred MoE epilogue consumed by Combine. Keep
   // stable addresses for graph replay without reserving all three stages.
-  float* const stage =
-      f32(std::max({linear_floats, attention_floats, expert_floats,
-                    T * (linear_projection + hc_dim)}));
+  const std::size_t stage_floats =
+      std::max({linear_floats, attention_floats, expert_floats,
+                T * (linear_projection + hc_dim)});
+  float* const stage = f32(stage_floats);
   if (stage == nullptr) {
     return false;
   }
+  // Every take() below must land inside the block reserved here. The stage
+  // maximum is easy to under-count when a stage adds slices (the rotated
+  // path did), so an overrun fails construction instead of leaving a wild
+  // pointer for run time.
+  float* const stage_end = stage + stage_floats;
+  bool stage_overrun = false;
   // Mixer gates die before attention/experts start. PLE also uses this
   // buffer as its key, so keep it beyond PLE's gated output at stage.
   s.hc_gate = stage + T * linear_projection;
@@ -1339,6 +1452,9 @@ bool Executor::CarveRowScratch(
   const auto take = [&](std::size_t count) {
     float* result = cursor;
     cursor += count;
+    if (cursor > stage_end) {
+      stage_overrun = true;
+    }
     return result;
   };
   // Stacked and separate SSM projections are mutually exclusive. MTP's
@@ -1381,9 +1497,17 @@ bool Executor::CarveRowScratch(
   s.routed_tiles = i32(3 * RoutedTileCapacity(slots, c));
   s.weights = f32(slots);
   cursor = stage;
-  s.gate_e = take(slots * c.expert_ff);
-  s.up_e = take(slots * c.expert_ff);
-  s.down_e = take(slots * hidden);
+  s.gate_e = take(expert_stage.gate_e);
+  s.up_e = take(expert_stage.up_e);
+  s.down_e = take(expert_stage.down_e);
+  s.x_rot = take(expert_stage.x_rot);
+  s.rot_gate_pre = take(expert_stage.rot_gate_pre);
+  s.rot_up_pre = take(expert_stage.rot_up_pre);
+  s.rot_down_in = take(expert_stage.rot_down_in);
+  s.rot_down_pre = take(expert_stage.rot_down_pre);
+  if (stage_overrun) {
+    return false;
+  }
   s.shexp_gate = f32(T * c.shared_expert_ff);
   s.shexp_up = f32(T * c.shared_expert_ff);
   s.shexp_out = f32(T * hidden);
@@ -1508,6 +1632,26 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     AssignError(error_msg, "session context exceeds the model context");
     return nullptr;
   }
+  // The ROCm GDN kernels are compiled for a single head dimension
+  // (kGdnSupportedHeadDim), while the per-layer state and convolution
+  // buffers sized below come from the runtime ssm_head_dim. A reduced
+  // head dimension would make the kernel address past those buffers, so
+  // refuse the session before any allocation or launch. Production
+  // rejects this at load time in Config::FromGguf; this also covers a
+  // config bound through the test seam, which copies the caller's config
+  // verbatim. See gdn_geometry.hpp.
+  if (!GdnHeadDimSupported(c.ssm_head_dim)) {
+    bool has_gdn_layer = false;
+    for (std::uint32_t il = 0; il < c.num_layers; ++il)
+      has_gdn_layer = has_gdn_layer || c.IsLinearLayer(il);
+    if (has_gdn_layer) {
+      AssignError(error_msg,
+                  "GDN head_dim " + std::to_string(c.ssm_head_dim) +
+                      " is not supported by the ROCm kernels (compiled for " +
+                      std::to_string(kGdnSupportedHeadDim) + ")");
+      return nullptr;
+    }
+  }
   s->max_context_ = max_context;
   // Before sparse attention starts, pooling can lag by indexer_top_k
   // rows. Afterwards only an incomplete block precedes the current batch.
@@ -1589,7 +1733,7 @@ bool Executor::AppendDraftRows(Session& session, std::uint32_t first,
     AssignError(error_msg, "invalid draft table append");
     return false;
   }
-  const auto& output = model_->output();
+  const auto& output = model_->draft_rows();
   const std::size_t row_bytes = model_->output_row_bytes();
   for (std::size_t i = 0; i < ids.size(); ++i) {
     if (ids[i] < 0 || static_cast<std::uint32_t>(ids[i]) >= output.rows) {
@@ -1628,7 +1772,7 @@ bool Executor::ClearDraftRows(Session& session, std::uint32_t first,
 }
 
 DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
-  DeviceTensor table = model_->output();
+  DeviceTensor table = model_->draft_rows();
   table.data = session.mtp_.draft_rows;
   table.rows = speculative::kDraftVocabExtraRows;
   return table;
@@ -1886,8 +2030,9 @@ std::size_t Executor::RollbackBytes(std::uint32_t depth) const noexcept {
   const std::size_t linear = c.num_layers - attention;
   const std::size_t conv =
       std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
-  const std::size_t state =
-      std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
+  // Single-sourced from the host geometry contract (gdn_geometry.hpp) so
+  // the allocator and the CPU sizing tests cannot drift apart.
+  const std::size_t state = GdnHostStateFloats(c.ssm_num_v_heads, c.ssm_head_dim);
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
   const std::size_t rollback_state =
@@ -2142,8 +2287,13 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
     return true;
   }
   // Swiglu is in place over its first operand.
-  if (!Dense(gate, x, out, n_tokens, error_msg) ||
-      !Dense(up, x, s_.shexp_gate, n_tokens, error_msg)) {
+  if (AllHt({&gate, &up})) {
+    if (!HtDenseGroup({{&gate, out}, {&up, s_.shexp_gate}}, x, n_tokens,
+                      error_msg)) {
+      return false;
+    }
+  } else if (!Dense(gate, x, out, n_tokens, error_msg) ||
+             !Dense(up, x, s_.shexp_gate, n_tokens, error_msg)) {
     return false;
   }
   // A wide batch writes the down projection's staged input directly (the
@@ -2194,8 +2344,86 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
          w.cols <= model_->max_half_cols();
 }
 
+bool Executor::AllHt(std::initializer_list<const DeviceTensor*> parts) noexcept {
+  for (const DeviceTensor* t : parts) {
+    if (t->empty() || t->type != GgmlType::kHT4 ||
+        t->cols != (*parts.begin())->cols)
+      return false;
+  }
+  return parts.size() > 0 && parts.size() <= HT_DENSE_MAX_GROUP;
+}
+
+bool Executor::HtDenseGroup(
+    std::initializer_list<std::pair<const DeviceTensor*, float*>> parts,
+    const float* x, std::uint32_t n_tokens, std::string* error_msg) const {
+  if (parts.size() == 0 || parts.size() > HT_DENSE_MAX_GROUP ||
+      ht_counters_ == nullptr) {
+    AssignError(error_msg, "ht group without kernel scratch");
+    return false;
+  }
+  const std::uint32_t cols = parts.begin()->first->cols;
+  for (const auto& [w, out] : parts) {
+    if (w->type != GgmlType::kHT4 || w->su == nullptr || w->sv == nullptr ||
+        w->cols != cols || out == nullptr) {
+      AssignError(error_msg, "ht group needs kHT4 matrices of one input width");
+      return false;
+    }
+  }
+  for (std::uint32_t r = 0; r < n_tokens; r += 8) {
+    const std::uint32_t n = std::min<std::uint32_t>(8, n_tokens - r);
+    HtGroupArgs g{};
+    for (const auto& [w, out] : parts) {
+      g.m[g.count++] = HtMatrix{static_cast<const std::uint8_t*>(w->data), w->su,
+                                w->sv, out + static_cast<std::size_t>(r) * w->rows,
+                                static_cast<int>(w->rows),
+                                static_cast<int>(w->rows)};
+    }
+    g.x = x + static_cast<std::size_t>(r) * cols;
+    g.cols = static_cast<int>(cols);
+    g.n_tokens = static_cast<int>(n);
+    g.x_stride = static_cast<int>(cols);
+    g.partials = ht_partials_;
+    g.counters = ht_counters_;
+    g.partial_capacity = ht_partial_floats_;
+    g.counter_capacity = ht_counter_count_;
+    if (!ht_dense_group(&g, stream_)) {
+      AssignError(error_msg, "ht matrix-vector launch failed");
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Executor::HtDense(const DeviceTensor& w, const float* x, float* out,
+                       std::uint32_t n_tokens, std::string* error_msg) const {
+  return HtDenseGroup({{&w, out}}, x, n_tokens, error_msg);
+}
+
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
+  if (w.type == GgmlType::kHT4) {
+    return HtDense(w, x, out, n_tokens, error_msg);
+  }
+  if (w.type == GgmlType::kQ6G64) {
+    // Hyper-connection projections stored as q6g64, read in place
+    // (q6g64_dense.hpp), up to eight token rows per launch.
+    for (std::uint32_t r = 0; r < n_tokens; r += 8) {
+      const std::uint32_t n = std::min<std::uint32_t>(8, n_tokens - r);
+      Q6g64DenseArgs a{static_cast<const std::uint8_t*>(w.data),
+                       x + static_cast<std::size_t>(r) * w.cols,
+                       out + static_cast<std::size_t>(r) * w.rows,
+                       static_cast<int>(w.rows),
+                       static_cast<int>(w.cols),
+                       static_cast<int>(n),
+                       static_cast<int>(w.cols),
+                       static_cast<int>(w.rows)};
+      if (!q6g64_dense_gemv(&a, stream_)) {
+        AssignError(error_msg, "q6g64 matrix-vector launch failed");
+        return false;
+      }
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ4_K) {
     // The draft head (DeviceModel::SetDraftVocab): use the dense Q4_K decode
     // kernel at decode widths.
@@ -3017,6 +3245,12 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     qkv = s_.qkvz;
     z = s_.qkvz + channels;
     qkv_stride = z_stride = l.ssm_in.rows;
+  } else if (!projections_ready && AllHt({&l.ssm_qkv, &l.ssm_gate})) {
+    // ht: qkv and gate read the same input; one grouped launch.
+    if (!HtDenseGroup({{&l.ssm_qkv, s_.qkv}, {&l.ssm_gate, s_.z}}, x, n_tokens,
+                      error_msg)) {
+      return false;
+    }
   } else if (!projections_ready) {
     Q8Input xq;
     if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
@@ -3141,7 +3375,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     }
   } else {
     Q8Input xq;
-    if (!projections_ready &&
+    if (!projections_ready && AllHt({&l.attn_q, &l.attn_k, &l.attn_v})) {
+      // ht: q (with gate), k and v read the same input; one grouped launch.
+      if (!HtDenseGroup({{&l.attn_q, s_.qg}, {&l.attn_k, s_.k}, {&l.attn_v, s_.v}},
+                        x, n_tokens, error_msg)) {
+        return false;
+      }
+    } else if (!projections_ready &&
         (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
          !Dense(l.attn_q, xq, s_.qg, error_msg) ||
          !Dense(l.attn_k, xq, s_.k, error_msg) ||
@@ -3347,7 +3587,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // is separately qualified. Rows are the total token rows, not sessions.
   const bool overlap = (ExpertMatrixRows(n_tokens) ||
                         (decode_overlap_ && n_tokens <= kVecBatch)) &&
-                       !last_only && l.shexp_gate.type == GgmlType::kQ8_0 &&
+                       !last_only && !l.shexp_split &&
+                       l.shexp_gate.type == GgmlType::kQ8_0 &&
                        l.shexp_up.type == GgmlType::kQ8_0 &&
                        l.shexp_down.type == GgmlType::kQ8_0;
   const hipStream_t main = stream_;
@@ -3407,6 +3648,12 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     stream_ = side_stream_;
   const auto shared_expert = [&] {
     shexp_half_ready_ = false;
+    if (l.shexp_split) {
+      // Addendum 1: only gate/up + SwiGLU here, on the main stream; the
+      // down projection is the second range of the batched gate+up launch.
+      return GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                        nullptr, error_msg);
+    }
     if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                     &l.shexp_down, error_msg)) {
       return false;
@@ -3464,7 +3711,9 @@ bool Executor::JoinSide(std::string* error_msg) const {
 
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
   const Config& c = config();
-  return ExpertMatrixRows(n_tokens) &&
+  // Rotated (I4R128) experts have their own dispatch in MoeExperts; the WMMA
+  // route must never claim them, whatever the K-quant checks below say.
+  return !l.rotated && ExpertMatrixRows(n_tokens) &&
          (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
           l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
@@ -3472,6 +3721,35 @@ bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
           l.ffn_down_exps.type == GgmlType::kQ8_0) &&
          c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
 }
+
+namespace {
+/// Wires the host-side rotated-expert dispatch to the I4R128 HIP kernels on
+/// the executor's stream. The dispatch (i4r_dispatch.hpp) owns the stage
+/// order and scale pairing; this only names the launchers.
+class HipRotatedOps final : public gufo::quant::RotatedOps {
+public:
+  explicit HipRotatedOps(hipStream_t stream) : stream_(stream) {}
+  void Rotate(const float* in, float* out, const float* pre_scale,
+              const float* post_scale, std::size_t count) override {
+    i4r_launch_rotate(in, out, pre_scale, post_scale,
+                      static_cast<int>(count / gufo::quant::kI4rBlock),
+                      stream_);
+  }
+  void Matvec(const std::uint8_t* M, const float* x, float* y,
+              std::size_t n_out, std::size_t n_blocks_in) override {
+    i4r_launch_mmvq(M, x, y, static_cast<int>(n_out),
+                    static_cast<int>(n_blocks_in), stream_);
+  }
+  void Gemm(const std::uint8_t* M, const float* X, float* Y, std::size_t n_out,
+            std::size_t n_in, int tokens) override {
+    i4r_launch_mmq(M, X, Y, static_cast<int>(n_out), static_cast<int>(n_in),
+                   tokens, stream_);
+  }
+
+private:
+  hipStream_t stream_;
+};
+}  // namespace
 
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                           std::uint32_t n_tokens,
@@ -3548,6 +3826,136 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       AssignError(error_msg, "routed F16 down GEMM failed");
       return false;
     }
+  } else if (l.rot_split) {
+    // Rotated (I4R128) experts, batched and device-routed: one launch for
+    // gate+up of every selected expert (input rotation fused into its
+    // staging, SwiGLU and the down-input rotation in its last-arriver
+    // finisher), one for down of every selected expert with the weighted
+    // combine, the output rotation (once, on the combined sum) and the gated
+    // shared expert. Expert ids and weights stay on the device, so there is
+    // no host round trip and the pass can be captured into a graph.
+    if (n_tokens > rot_counter_tokens_) {
+      AssignError(error_msg, "rotated batch exceeds the arrival counter capacity");
+      return false;
+    }
+    I4rGateUpArgs gu{};
+    gu.gate = static_cast<const std::uint8_t*>(l.ffn_gate_exps.data);
+    gu.up = static_cast<const std::uint8_t*>(l.ffn_up_exps.data);
+    gu.n_experts = l.ffn_gate_exps.experts;
+    gu.x = x;
+    gu.ids = s_.ids;
+    gu.su_experts = l.rot_su_experts.f32();
+    gu.sv_gate = l.rot_sv_gate.f32();
+    gu.sv_up = l.rot_sv_up.f32();
+    gu.su_down = l.rot_su_down.f32();
+    gu.gate_part = s_.gate_e;
+    gu.up_part = s_.up_e;
+    gu.counters = rot_counters_up_;
+    gu.hidden = static_cast<int>(c.hidden_size);
+    gu.ff = static_cast<int>(c.expert_ff);
+    gu.used = static_cast<int>(used);
+    gu.n_tokens = static_cast<int>(n_tokens);
+    gu.plain_f16 = rot_plain_f16_ ? 1 : 0;
+    if (l.shexp_split) {
+      if (l.shexp_down.cols / 128 > used) {
+        AssignError(error_msg, "shared-expert slices exceed the partial scratch");
+        return false;
+      }
+      gu.shared_down = static_cast<const std::uint8_t*>(l.shexp_down.data);
+      gu.shared_in = s_.shexp_up;
+      gu.shared_part = s_.down_e;
+      gu.shared_out = s_.shexp_out;
+      gu.shared_counters = rot_counters_shared_;
+      gu.shared_ff = static_cast<int>(l.shexp_down.cols);
+    }
+    if (!i4r_fused_gate_up(&gu, static_cast<int>(slots), stream_)) {
+      AssignError(error_msg, "rotated gate/up launch has no instantiation");
+      return false;
+    }
+    // The down launch's finisher adds the gated shared expert.
+    if (!JoinSide(error_msg))
+      return false;
+    I4rDownArgs dn{};
+    dn.down = static_cast<const std::uint8_t*>(l.ffn_down_exps.data);
+    dn.n_experts = l.ffn_down_exps.experts;
+    dn.down_in = s_.gate_e;
+    dn.ids = s_.ids;
+    dn.weights = s_.weights;
+    dn.sv_down = l.rot_sv_down.f32();
+    dn.shared_out = s_.shexp_out;
+    dn.shared_gate = s_.router + c.num_experts;
+    dn.shared_gate_stride = c.num_experts + 1;
+    dn.down_part = s_.down_e;
+    dn.out = out;
+    dn.counters = rot_counters_down_;
+    dn.hidden = static_cast<int>(c.hidden_size);
+    dn.ff = static_cast<int>(c.expert_ff);
+    dn.used = static_cast<int>(used);
+    dn.per_slot_out = rot_per_slot_for_test_ ? 1 : 0;
+    dn.plain_f16 = rot_plain_f16_ ? 1 : 0;
+    if (!i4r_fused_down(&dn, static_cast<int>(n_tokens), stream_)) {
+      AssignError(error_msg, "rotated down launch has no instantiation");
+      return false;
+    }
+    return true;
+  } else if (l.rotated) {
+    // Rotated (I4R128) experts: hoist the input rotation once per layer,
+    // then run the gate/up and down sides through the dispatch. The down
+    // output lands in s_.down_e in the same [slots x hidden] F32 layout the
+    // plain path uses, so the shared epilogue below is unchanged.
+    //
+    // EAGER ONLY. Option (a) chooses each slot's expert weight pointer in a
+    // host loop, so those offsets become kernel arguments picked by CPU code.
+    // Capturing this pass would freeze today's routing into the graph and
+    // replay could never route differently. Making the rotated path
+    // capturable means keeping the selection device-side, which is a later
+    // step; refuse loudly rather than silently bake a stale routing.
+    if (capturing_) {
+      AssignError(error_msg,
+                  "rotated I4R128 experts cannot run inside a graph capture: "
+                  "host-side expert selection would freeze this pass's routing "
+                  "into the captured kernel arguments");
+      return false;
+    }
+    // RouterTopK queued its result on stream_ and s_.ids may live in
+    // hipMalloc memory, which the host may not be able to read at all -- and
+    // even where it can, the router has only been queued, not completed.
+    // Stage the ids into pinned host memory and wait for the stream, so the
+    // dispatch's host loop reads values that are both addressable and
+    // current. The input rotation is queued first so the wait overlaps it.
+    if (ids_host_ == nullptr) {
+      AssignError(error_msg,
+                  "rotated dispatch has no pinned expert id staging");
+      return false;
+    }
+    const auto* gate_w = static_cast<const std::uint8_t*>(l.ffn_gate_exps.data);
+    const auto* up_w = static_cast<const std::uint8_t*>(l.ffn_up_exps.data);
+    const auto* down_w = static_cast<const std::uint8_t*>(l.ffn_down_exps.data);
+    const std::size_t hidden = c.hidden_size;
+    const std::size_t ff = c.expert_ff;
+    const bool prefill = prefill_phase;
+    HipRotatedOps ops(stream_);
+    gufo::quant::RotatedScales sc;
+    sc.su_experts = l.rot_su_experts.f32();
+    sc.sv_gate = l.rot_sv_gate.f32();
+    sc.sv_up = l.rot_sv_up.f32();
+    sc.su_down = l.rot_su_down.f32();
+    sc.sv_down = l.rot_sv_down.f32();
+    gufo::quant::RotateLayerInput(ops, x, sc, hidden, n_tokens, s_.x_rot);
+    if (!Check(hipMemcpyAsync(ids_host_, s_.ids, slots * sizeof(std::int32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               "rotated expert id download", error_msg) ||
+        !Check(hipStreamSynchronize(stream_), "rotated expert id wait",
+               error_msg)) {
+      return false;
+    }
+    gufo::quant::RotatedGateUp(ops, gate_w, up_w, sc, s_.x_rot, ids_host_,
+                               hidden, ff, slots, used, prefill, s_.gate_e,
+                               s_.up_e, s_.rot_gate_pre, s_.rot_up_pre);
+    Swiglu(s_.gate_e, s_.up_e, static_cast<std::size_t>(slots) * ff, stream_);
+    gufo::quant::RotatedDown(ops, down_w, sc, s_.gate_e, ids_host_, hidden, ff,
+                             slots, used, prefill, s_.down_e, s_.rot_down_in,
+                             s_.rot_down_pre);
   } else {
     if (!GatedExperts(l.ffn_gate_exps, l.ffn_up_exps, x, s_.ids, s_.gate_e,
                       n_tokens, used, error_msg)) {
@@ -3899,9 +4307,13 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const std::uint32_t pool_grid =
       sparse && complete > session.blocks_ ? complete - session.blocks_ : 0;
   // Decode-sized batches replay as graphs; a pooling backlog (the first
-  // batch past the budget) needs the wider eager grid.
+  // batch past the budget) needs the wider eager grid. Rotated-expert
+  // models never capture: the rotated dispatch picks each slot's expert
+  // weight pointer in a host loop, so capture would freeze this pass's
+  // routing into kernel arguments and replay could never route
+  // differently. Every rotated decode stays eager.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = !prefill_phase && n <= kVecBatch &&
+  const bool graph = !host_routed_experts_ && !prefill_phase && n <= kVecBatch &&
                      pool_grid <= graph_pool_grid &&
                      session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
@@ -4485,7 +4897,11 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.num_layers = c.num_layers;
   h.full_attention_interval = c.full_attention_interval;
   h.conv_elems = (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
-  h.state_elems = c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim;
+  // Same contract as the session allocator above; the uint32_t field is
+  // wide enough for every geometry the contract admits (head_dim 128).
+  h.state_elems =
+      static_cast<std::uint32_t>(GdnHostStateFloats(c.ssm_num_v_heads,
+                                                   c.ssm_head_dim));
   h.kv_row = c.AttentionKvDim();
   h.indexer_head_dim = c.indexer_head_dim;
   h.compress_ratio = c.compress_ratio;

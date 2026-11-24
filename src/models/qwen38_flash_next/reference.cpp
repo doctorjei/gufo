@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <numeric>
 
+#include "src/core/quant/i4r_rotation.hpp"
 #include "src/models/qwen38_flash_next/cpu_ops.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -43,6 +46,39 @@ std::vector<float> QuantizedInput(std::span<const float> input) {
           peak == 0 ? 0 : stored * std::round(input[base + j] / scale);
   }
   return result;
+}
+
+/// Reads one F16 rotation vector into float32.
+std::vector<float> F16Vector(const TensorRef& t) {
+  std::vector<float> out(t.cols);
+  const auto* src = static_cast<const std::uint8_t*>(t.data);
+  for (std::size_t i = 0; i < t.cols; ++i) {
+    std::uint16_t h = 0;
+    std::memcpy(&h, src + 2 * i, 2);
+    out[i] = gufo::quant::Fp16ToFloat(h);
+  }
+  return out;
+}
+
+/// Stages 1-2 of the rotated path for one side: scale by `su`, then apply
+/// the orthonormal Hadamard to every 128-block. `out` receives the rotated
+/// copy of `x`.
+void RotateIn(std::span<const float> x, const std::vector<float>& su,
+              std::vector<float>& out) {
+  out.resize(x.size());
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    out[i] = x[i] * su[i];
+  }
+  gufo::quant::RotateBlocks(out.data(), out.size());
+}
+
+/// Stages 4-5: Hadamard each 128-block of the raw product, then scale by
+/// `sv`. In place on `y`.
+void RotateOut(std::vector<float>& y, const std::vector<float>& sv) {
+  gufo::quant::RotateBlocks(y.data(), y.size());
+  for (std::size_t i = 0; i < y.size(); ++i) {
+    y[i] *= sv[i];
+  }
 }
 }  // namespace
 
@@ -530,15 +566,43 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
   std::vector<float> gate(c_.expert_ff);
   std::vector<float> up(c_.expert_ff);
   std::vector<float> down(c_.hidden_size);
+
+  // Rotated experts (I4R128) store M, the weight in the Hadamard basis.
+  // The five stages of i4r_rotation.hpp wrap the plain matvec; the input
+  // rotation is shared by every expert of the layer, so it is hoisted here.
+  // The rotation itself always runs in float32: it is exact math on the
+  // oracle's side, not a storage emulation.
+  const bool rotated = l.rotation.rotated;
+  std::vector<float> sv_gate, sv_up, su_down, sv_down, xr, hd;
+  if (rotated) {
+    sv_gate = F16Vector(l.rotation.sv_gate);
+    sv_up = F16Vector(l.rotation.sv_up);
+    su_down = F16Vector(l.rotation.su_down);
+    sv_down = F16Vector(l.rotation.sv_down);
+    RotateIn(x, F16Vector(l.rotation.su_experts), xr);
+  }
   for (std::uint32_t i = 0; i < c_.num_experts_used; ++i) {
     const std::uint32_t e = order[i];
     const float weight = logits[e] / sum;
-    MatVec(l.ffn_gate_exps, e, x, gate);
-    MatVec(l.ffn_up_exps, e, x, up);
+    if (rotated) {
+      MatVec(l.ffn_gate_exps, e, xr, gate);
+      MatVec(l.ffn_up_exps, e, xr, up);
+      RotateOut(gate, sv_gate);
+      RotateOut(up, sv_up);
+    } else {
+      MatVec(l.ffn_gate_exps, e, x, gate);
+      MatVec(l.ffn_up_exps, e, x, up);
+    }
     for (std::uint32_t j = 0; j < c_.expert_ff; ++j) {
       gate[j] = Silu(gate[j]) * up[j];
     }
-    MatVec(l.ffn_down_exps, e, gate, down);
+    if (rotated) {
+      RotateIn(gate, su_down, hd);
+      MatVec(l.ffn_down_exps, e, hd, down);
+      RotateOut(down, sv_down);
+    } else {
+      MatVec(l.ffn_down_exps, e, gate, down);
+    }
     for (std::uint32_t j = 0; j < c_.hidden_size; ++j) {
       out[j] += weight * down[j];
     }

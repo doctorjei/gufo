@@ -88,6 +88,23 @@ struct block_iq3_s {
   std::uint8_t signs[32];
   std::uint8_t scales[4];
 };
+
+// I4R128: 128 offset-binary 4-bit codes plus one f16 scale, 66 bytes per
+// 128 values (4.125 bpw). Codes use the GGUF nibble order shared with Q4_0 /
+// Q4_K: for block byte b (0 <= b < 64) the low nibble is value b and the high
+// nibble is value 64 + b. Decoded value is (code - 8) * d, exact in f32; d
+// may be any f16 including zero.
+//
+// IMPORTANT: the decoded values are the ROTATED stored numbers M, not the true
+// weight W. The true weight is W = diag(sv) * Hn * M * Hn * diag(su), with
+// Hn the orthonormal 128-point Sylvester-Hadamard matrix and su/sv per-layer
+// f16 rotation vectors. DequantizeI4R128 therefore yields M; callers that
+// need W must apply the rotation stages (see i4r_rotation.hpp). Treating these
+// codes as plain (unrotated) weights produces silently wrong numbers.
+struct block_i4r128 {
+  std::uint8_t codes[64];
+  std::uint16_t d;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
@@ -99,6 +116,7 @@ static_assert(sizeof(block_q8_0) == 34, "block_q8_0 must be 34 bytes");
 static_assert(sizeof(block_iq4_nl) == 18, "block_iq4_nl must be 18 bytes");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s must be 110 bytes");
+static_assert(sizeof(block_i4r128) == 66, "block_i4r128 must be 66 bytes");
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
 inline constexpr std::int8_t kValuesIq4Nl[16] = {
@@ -132,6 +150,8 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
     case core::GgmlType::kQ6_K:
     case core::GgmlType::kQ8_K:
       return 256;
+    case core::GgmlType::kI4R128:
+      return 128;
     default:
       return 0;
   }
@@ -202,6 +222,12 @@ float DotProductIQ4_XS(const void* row_data, std::span<const float> vec,
 // Compute dot product of IQ3_S quantized row with FP32 vector
 float DotProductIQ3_S(const void* row_data, std::span<const float> vec,
                       std::size_t k);
+
+// I4R128: decodes to the rotated stored numbers M (see block_i4r128 above).
+// `k` must be a multiple of 128.
+void DequantizeI4R128(const void* src, float* dst, std::size_t k);
+float DotProductI4R128(const void* row_data, std::span<const float> vec,
+                       std::size_t k);
 
 // The remaining GGML block formats, element for element as ggml-quants.c's
 // dequantize_row_* (Q4_0, Q4_1, Q5_0: 32 elements; Q2_K and the IQ1/IQ2/IQ3

@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/quant/hgn_decode.hpp"
+#include "src/core/quant/i4r_fused.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -75,6 +77,24 @@ struct Uploader {
     return weights->Allocate(pointer, size);
   }
 
+  /// Moves one payload to the device: from the file through the stager, or,
+  /// for a tensor decoded on the host at bind time, from its host buffer.
+  bool CopyPayload(const TensorRef& t, std::size_t size, void* dst) {
+    if (t.HostDecoded()) {
+      if (hipMemcpy(dst, t.data, size, hipMemcpyHostToDevice) != hipSuccess) {
+        Fail("upload failed for decoded " + std::string(t.name));
+        return false;
+      }
+      return true;
+    }
+    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, dst, error)) {
+      Fail("upload failed for " + std::string(t.name) +
+           (error != nullptr ? ": " + *error : std::string()));
+      return false;
+    }
+    return true;
+  }
+
   DeviceTensor Copy(const TensorRef& t) {
     DeviceTensor d;
     if (t.empty() || !ok) {
@@ -92,9 +112,7 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
-    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr, error)) {
-      Fail("upload failed for " + std::string(t.name) +
-           (error != nullptr ? ": " + *error : std::string()));
+    if (!CopyPayload(t, size, ptr)) {
       return d;
     }
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
@@ -110,7 +128,40 @@ struct Uploader {
     if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
+    if (t.type == core::GgmlType::kHT4) {
+      d.su = UploadHalfVector(t.rot_su, t.cols, t.name);
+      d.sv = UploadHalfVector(t.rot_sv, t.rows, t.name);
+    }
     return d;
+  }
+
+  /// Widens `count` F16 values on the host to an F32 device vector (exact).
+  const float* UploadHalfVector(const void* src, std::size_t count,
+                                std::string_view name) {
+    void* f32 = nullptr;
+    if (src == nullptr ||
+        Allocate(&f32, count * sizeof(float) + kTailMargin) != hipSuccess) {
+      Fail("rotation vector upload failed for " + std::string(name));
+      return nullptr;
+    }
+    if (Measuring()) {
+      return nullptr;
+    }
+    allocations.push_back(f32);
+    bytes += count * sizeof(float) + kTailMargin;
+    std::vector<float> host(count);
+    const auto* bits = static_cast<const std::uint16_t*>(src);
+    for (std::size_t i = 0; i < count; ++i) {
+      _Float16 h;
+      std::memcpy(&h, bits + i, sizeof(h));
+      host[i] = static_cast<float>(h);
+    }
+    if (hipMemcpy(f32, host.data(), count * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+      Fail("rotation vector upload failed for " + std::string(name));
+      return nullptr;
+    }
+    return static_cast<const float*>(f32);
   }
 
   /// Uploads a narrow projection the quantized tier does not cover (the
@@ -166,6 +217,51 @@ struct Uploader {
     bytes += count * sizeof(float) + kTailMargin;
     std::vector<float> host(count);
     WidenBF16(static_cast<const std::uint16_t*>(t.data), host.data(), count);
+    if (hipMemcpy(f32, host.data(), count * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemset(static_cast<std::uint8_t*>(f32) + count * sizeof(float), 0,
+                  kTailMargin) != hipSuccess) {
+      Fail("upload failed for " + std::string(t.name));
+      return d;
+    }
+    d.data = f32;
+    d.type = core::GgmlType::kF32;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = static_cast<std::uint32_t>(t.experts);
+    return d;
+  }
+
+  /// Uploads one F16 rotation vector widened to F32. The rotate kernel takes
+  /// float scales, so the F16 vectors the loader bound are widened on the
+  /// host (exact: F16 -> F32 is lossless) and copied up as F32.
+  DeviceTensor UploadRotVector(const TensorRef& t) {
+    DeviceTensor d;
+    if (t.empty() || !ok) {
+      return d;
+    }
+    const std::size_t count = t.cols * t.rows * t.experts;
+    void* f32 = nullptr;
+    if (Allocate(&f32, count * sizeof(float) + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(t.name));
+      return d;
+    }
+    if (Measuring()) {
+      return d;
+    }
+    allocations.push_back(f32);
+    bytes += count * sizeof(float) + kTailMargin;
+    std::vector<float> host(count);
+    const auto* src = static_cast<const std::uint16_t*>(t.data);
+    for (std::size_t i = 0; i < count; ++i) {
+      const _Float16 h = [&] {
+        std::uint16_t bits = src[i];
+        _Float16 v;
+        std::memcpy(&v, &bits, sizeof(v));
+        return v;
+      }();
+      host[i] = static_cast<float>(h);
+    }
     if (hipMemcpy(f32, host.data(), count * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess ||
         hipMemset(static_cast<std::uint8_t*>(f32) + count * sizeof(float), 0,
@@ -259,9 +355,8 @@ struct Uploader {
       bytes += size + kTailMargin;
       std::size_t offset = 0;
       for (const TensorRef* t : parts) {
-        if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
-                         static_cast<std::uint8_t*>(ptr) + offset, error)) {
-          Fail("upload failed for " + std::string(t->name));
+        if (!CopyPayload(*t, t->SizeBytes(),
+                         static_cast<std::uint8_t*>(ptr) + offset)) {
           return d;
         }
         offset += t->SizeBytes();
@@ -378,6 +473,14 @@ struct Uploader {
     d.ffn_gate_exps = Copy(l.ffn_gate_exps);
     d.ffn_up_exps = Copy(l.ffn_up_exps);
     d.ffn_down_exps = Copy(l.ffn_down_exps);
+    if (l.rotation.rotated) {
+      d.rotated = true;
+      d.rot_su_experts = UploadRotVector(l.rotation.su_experts);
+      d.rot_sv_gate = UploadRotVector(l.rotation.sv_gate);
+      d.rot_sv_up = UploadRotVector(l.rotation.sv_up);
+      d.rot_su_down = UploadRotVector(l.rotation.su_down);
+      d.rot_sv_down = UploadRotVector(l.rotation.sv_down);
+    }
     d.shexp_gate = Copy(l.shexp_gate);
     d.shexp_up = Copy(l.shexp_up);
     d.shexp_down = Copy(l.shexp_down);
@@ -427,30 +530,33 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
       *error_msg = message;
     return false;
   };
-  if (output_.empty() || output_.rows == 0 || output_bytes_ % output_.rows != 0)
+  const DeviceTensor& src = draft_rows();
+  const std::size_t src_bytes = draft_rows_.empty() ? output_bytes_ : draft_rows_bytes_;
+  if (src.empty() || src.rows == 0 || src_bytes % src.rows != 0 ||
+      src.type == core::GgmlType::kHT4)
     return fail("draft vocabulary needs a row-addressable output head");
-  if (prefix_rows == 0 || prefix_rows >= output_.rows)
+  if (prefix_rows == 0 || prefix_rows >= src.rows)
     return fail("draft vocabulary prefix must leave rows out");
   for (const auto id : specials) {
     if (id < static_cast<std::int32_t>(prefix_rows) ||
-        static_cast<std::uint32_t>(id) >= output_.rows)
+        static_cast<std::uint32_t>(id) >= src.rows)
       return fail("draft special tokens must lie above the prefix");
   }
-  draft_output_ = output_;
+  draft_output_ = src;
   draft_output_.rows = prefix_rows;
-  if (output_.type == core::GgmlType::kQ8_0 && output_.cols % 256 == 0) {
+  if (src.type == core::GgmlType::kQ8_0 && src.cols % 256 == 0) {
     // Drafts read a Q4_K copy of the Q8_0 prefix: the head is the larger
     // part of each draft step's weight traffic, and its proposals are
     // verified, so this changes acceptance only. Each row of the copy is
     // the same at any batch width.
     const std::size_t bytes =
-        std::size_t{prefix_rows} * (output_.cols / 256) * 144;
+        std::size_t{prefix_rows} * (src.cols / 256) * 144;
     void* q4k = nullptr;
     if (hipMalloc(&q4k, bytes + kTailMargin) != hipSuccess)
       return fail("device allocation failed for the Q4_K draft head");
     allocations_.push_back(q4k);
     bytes_ += bytes + kTailMargin;
-    QuantizeQ8_0ToQ4K(output_.data, q4k, prefix_rows, output_.cols, nullptr);
+    QuantizeQ8_0ToQ4K(src.data, q4k, prefix_rows, src.cols, nullptr);
     if (hipMemsetAsync(static_cast<std::uint8_t*>(q4k) + bytes, 0, kTailMargin,
                        nullptr) != hipSuccess ||
         hipStreamSynchronize(nullptr) != hipSuccess)
@@ -543,6 +649,39 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;
   m->has_mtp_ = mtp != nullptr;
+  if (mtp != nullptr && w.output.type == core::GgmlType::kHT4) {
+    // The MTP draft vocabulary copies head rows; an ht head stores rows only
+    // as rotated 128-row bands, so keep a Q8_0 copy for the drafts.
+    const std::size_t rows = w.output.rows, cols = w.output.cols;
+    const std::size_t bytes = rows * (cols / 32) * 34;
+    std::vector<std::uint8_t> host;
+    std::string why;
+    void* q8 = nullptr;
+    try {
+      host.resize(bytes);
+    } catch (...) {
+      if (error_msg != nullptr) *error_msg = "out of host memory for the Q8_0 draft head";
+      return nullptr;
+    }
+    if (!quant::DecodeHgnToQ8_0(core::GgmlType::kHT4, w.output.data, cols, rows,
+                                static_cast<const std::uint16_t*>(w.output.rot_su),
+                                static_cast<const std::uint16_t*>(w.output.rot_sv),
+                                host.data(), &why) ||
+        hipMalloc(&q8, bytes + kTailMargin) != hipSuccess ||
+        hipMemcpy(q8, host.data(), bytes, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemset(static_cast<std::uint8_t*>(q8) + bytes, 0, kTailMargin) != hipSuccess) {
+      if (error_msg != nullptr) *error_msg = "Q8_0 draft head failed: " + why;
+      return nullptr;
+    }
+    m->allocations_.push_back(q8);
+    m->bytes_ += bytes + kTailMargin;
+    m->draft_rows_ = m->output_;
+    m->draft_rows_.data = q8;
+    m->draft_rows_.type = core::GgmlType::kQ8_0;
+    m->draft_rows_.su = nullptr;
+    m->draft_rows_.sv = nullptr;
+    m->draft_rows_bytes_ = bytes;
+  }
   for (const auto& c : conversions) {
     if (c.expand_q8) {
       ExpandQ8_0(c.source, static_cast<float*>(c.destination), c.count,
@@ -550,6 +689,70 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     } else {
       NarrowActivations(static_cast<const float*>(c.source), c.destination,
                         false, c.count, nullptr);
+    }
+  }
+  // Rotated (I4R128) experts: repack each expert tensor once into a codes
+  // region and a scales region, the layout the batched decode kernels read
+  // with 16-byte loads (i4r_fused.hpp). Geometries without a compiled
+  // instantiation keep the GGUF layout and the unbatched dispatch.
+  {
+    std::vector<DeviceLayer*> expert_layers;
+    for (auto& l : m->layers_) expert_layers.push_back(&l);
+    if (m->has_mtp_) expert_layers.push_back(&m->mtp_);
+    std::size_t widest = 0;
+    for (const DeviceLayer* lp : expert_layers) {
+      const DeviceLayer& l = *lp;
+      if (l.rotated && I4rFusedSupports(l.ffn_gate_exps.cols, l.ffn_gate_exps.rows)) {
+        for (const DeviceTensor* t : {&l.ffn_gate_exps, &l.ffn_up_exps, &l.ffn_down_exps})
+          widest = std::max<std::size_t>(widest, std::size_t{t->experts} * t->rows *
+                                                     (t->cols / 128) * 66);
+      }
+    }
+    if (widest != 0) {
+      void* temp = nullptr;
+      if (hipMalloc(&temp, widest) != hipSuccess) {
+        if (error_msg != nullptr)
+          *error_msg = "rotated expert repack: temp allocation failed";
+        return nullptr;
+      }
+      bool repack_ok = true;
+      for (DeviceLayer* lp : expert_layers) {
+        DeviceLayer& l = *lp;
+        if (!l.rotated || !I4rFusedSupports(l.ffn_gate_exps.cols, l.ffn_gate_exps.rows))
+          continue;
+        for (DeviceTensor* t : {&l.ffn_gate_exps, &l.ffn_up_exps, &l.ffn_down_exps}) {
+          const std::size_t n_blocks = std::size_t{t->experts} * t->rows * (t->cols / 128);
+          repack_ok = repack_ok &&
+                      hipMemcpyAsync(temp, t->data, n_blocks * 66,
+                                     hipMemcpyDeviceToDevice, nullptr) == hipSuccess &&
+                      i4r_repack_split(static_cast<const std::uint8_t*>(temp),
+                                       static_cast<std::uint8_t*>(t->data), n_blocks,
+                                       nullptr);
+        }
+        l.rot_split = true;
+        // Addendum 1: the shared expert's down projection runs as a second
+        // workgroup range of the gate+up launch. Q8_0 only, repacked the
+        // same way (int8 codes region, then f16 scales).
+        DeviceTensor& sd = l.shexp_down;
+        if (!sd.empty() && sd.type == core::GgmlType::kQ8_0 && sd.experts == 1 &&
+            sd.cols % 128 == 0 && sd.rows == l.ffn_gate_exps.cols) {
+          const std::size_t n_blocks = std::size_t{sd.rows} * (sd.cols / 32);
+          repack_ok = repack_ok &&
+                      hipMemcpyAsync(temp, sd.data, n_blocks * 34,
+                                     hipMemcpyDeviceToDevice, nullptr) == hipSuccess &&
+                      i4r_repack_q8_split(static_cast<const std::uint8_t*>(temp),
+                                          static_cast<std::uint8_t*>(sd.data), n_blocks,
+                                          nullptr);
+          l.shexp_split = true;
+        }
+      }
+      const auto repack_status = hipDeviceSynchronize();
+      (void)hipFree(temp);
+      if (!repack_ok || repack_status != hipSuccess) {
+        if (error_msg != nullptr)
+          *error_msg = "rotated expert repack failed";
+        return nullptr;
+      }
     }
   }
   const auto status = hipDeviceSynchronize();
