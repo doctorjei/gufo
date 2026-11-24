@@ -13,15 +13,20 @@ source code, binary content or trace reached the implementation.
    formats, the decoders in `src/core/quant/hgn_decode.cpp` and
    `tools/hgn2gguf/` come from it. The decoders are checked against its
    `TEST-VECTORS.md`.
-2. **Two functional specs written for this work** under the clean-room
-   process below. They are published at
+2. **Three functional specs written for this work** under the clean-room
+   process below. The first two are published at
    <https://github.com/doctorjei/i4r-expert-decode-halogen> (the i4r spec as
-   `README.md`, the ht spec as `ht-dense-decode.md`):
+   `README.md`, the ht spec as `ht-dense-decode.md`); the prefill spec is not
+   published yet:
    - the **i4r decode spec** (draft 1 plus addendum 1): batched routed-expert
      decode for i4r experts, implemented in
      `src/core/quant/i4r_fused_kernels.hip.cpp`;
    - the **ht dense decode spec** (draft 3): matrix-vector products for 4-bit
-     ht weights, implemented in `src/core/quant/ht_dense_kernels.hip.cpp`.
+     ht weights, implemented in `src/core/quant/ht_dense_kernels.hip.cpp`;
+   - the **prefill spec** (draft 3): the prompt pass at 2,000 to 4,000 tokens,
+     used for the prefill expert kernels (`GateUpPrefillKernel`,
+     `DownPrefillKernel` in `src/core/quant/i4r_fused_kernels.hip.cpp`) and
+     the folded ht prefill decode (`src/core/quant/hgn_prefill_kernels.hip.cpp`).
 3. **Gufo upstream.**
 
 The q6g64 kernel (`src/core/quant/q6g64_dense_kernels.hip.cpp`) was designed
@@ -38,12 +43,18 @@ from the public format alone.
   also motivated the separate verify-batch split plan and the 5- and
   6-token builds in `ht_dense_kernels.hip.cpp`; the plan itself was chosen
   by measurement.
+- **From the prefill spec:** tokens grouped by expert on the device and a
+  work list of 64-token tiles; expert tiles of 64 tokens by 256 rows with the
+  4-bit weights decoded inside the matrix-core launch and single-pass 16-bit
+  inputs; ht matrices decoded once per pass to f16 with the rotations folded
+  in, then a dense GEMM. The tile internals (fragment layout, where the block
+  scale is applied, the finisher) and the decode kernel were designed here;
+  the spec leaves them open.
 - **Designed on this side, from public sources only:** sharing an expert's
   weights across the tokens of an MTP verify batch (the `*ShareKernel`
-  launches); all of prefill for these formats, i.e. grouping a chunk's slots
-  by expert, the matrix-core (WMMA) grouped expert kernels, and decoding ht
-  and q6g64 matrices to f16 for a GEMM (`src/core/quant/hgn_prefill*`); the
-  q6g64 kernels; and the hgn2gguf converter. The specs cover decode only.
+  launches); the earlier prefill path (the dot-product and first matrix-core
+  grouped kernels, still used for short prompts); the q6g64 kernels and
+  decode; and the hgn2gguf converter.
 
 ## The clean-room process
 
