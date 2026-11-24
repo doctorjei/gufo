@@ -14,7 +14,9 @@ source code, binary content or trace reached the implementation.
    `tools/hgn2gguf/` come from it. The decoders are checked against its
    `TEST-VECTORS.md`.
 2. **Two functional specs written for this work** under the clean-room
-   process below:
+   process below. They are published at
+   <https://github.com/doctorjei/i4r-expert-decode-halogen> (the i4r spec now;
+   the ht spec is to be added there):
    - the **i4r decode spec** (draft 1 plus addendum 1): batched routed-expert
      decode for i4r experts, implemented in
      `src/core/quant/i4r_fused_kernels.hip.cpp`;
