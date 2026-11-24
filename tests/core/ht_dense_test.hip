@@ -317,7 +317,7 @@ int main() {
     int rows, cols;
   } shapes[] = {{256, 384}, {640, 2560}, {2560, 6144}, {512, 2560}, {128 * 700, 256}};
   for (const auto& s : shapes) {
-    for (int n : {1, 2, 3, 5, 8}) {
+    for (int n : {1, 2, 3, 5, 6, 7, 8}) {
       if (s.rows == 128 * 700 && n > 2) continue;
       const double e = RunCase(s.rows, s.cols, n, rng, false);
       const bool ok = e < kGate;
@@ -326,6 +326,18 @@ int main() {
       failures += ok ? 0 : 1;
     }
   }
+  // The verify-batch plan with fewer splits must give the same results.
+  ht_dense_set_batch_target(0);
+  for (const auto& s2 : std::vector<std::pair<int, int>>{{640, 2560}, {2560, 6144}, {6144, 2560}}) {
+    for (int n : {2, 5, 8}) {
+      const double e = RunCase(s2.first, s2.second, n, rng, false);
+      const bool ok = e < kGate;
+      std::printf("%s batch plan rows=%d cols=%d n=%d splits=%d err=%.3e\n", ok ? "PASS" : "FAIL",
+                  s2.first, s2.second, n, ht_dense_splits_for(s2.first, s2.second, n), e);
+      failures += ok ? 0 : 1;
+    }
+  }
+  ht_dense_set_batch_target(0);
   const double neg = RunCase(640, 2560, 1, rng, true);
   const bool neg_ok = neg > 10 * kGate;
   std::printf("%s negative control err=%.3e\n", neg_ok ? "PASS" : "FAIL", neg);
@@ -380,6 +392,27 @@ int main() {
   hipEvent_t e0, e1;
   HIP_OK(hipEventCreate(&e0));
   HIP_OK(hipEventCreate(&e1));
+  // Verify-batch plan sweep: time the batch sizes at several workgroup
+  // targets (640 = the single-token plan), then keep the default.
+  for (int target : {0, 640}) {  // 0 = the default batch plan
+    ht_dense_set_batch_target(target);
+    for (const auto& r : real) {
+      if (r.rows > 100000) continue;
+      for (int n : {2, 4, 5, 6, 8}) {
+        HtDenseArgs a{dcodes, dv, dv, dx, dout, dpart, dcnt, r.rows, r.cols, n, r.cols, r.rows};
+        for (int i = 0; i < 5; ++i) (void)ht_dense_gemv(&a, nullptr);
+        HIP_OK(hipEventRecord(e0, nullptr));
+        for (int i = 0; i < 200; ++i) (void)ht_dense_gemv(&a, nullptr);
+        HIP_OK(hipEventRecord(e1, nullptr));
+        HIP_OK(hipEventSynchronize(e1));
+        float ms = 0.0f;
+        HIP_OK(hipEventElapsedTime(&ms, e0, e1));
+        std::printf("SWEEP target=%-3d %-12s n=%d splits=%-2d %8.1f us\n", target, r.name, n,
+                    ht_dense_splits_for(r.rows, r.cols, n), 1000.0 * ms / 200);
+      }
+    }
+  }
+  ht_dense_set_batch_target(0);
   for (const auto& r : real) {
     for (int n : {1, 4, 8}) {
       HtDenseArgs a{dcodes, dv, dv, dx, dout, dpart, dcnt, r.rows, r.cols, n, r.cols, r.rows};
