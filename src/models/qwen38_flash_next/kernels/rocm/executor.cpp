@@ -2495,8 +2495,14 @@ bool Executor::WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
       half_bf16_ = false;
     }
   }
-  if (!blaslt_->Gemm(wide_w16_, s_.x_half, out, HIP_R_16F, m, n, k, error_msg))
+  // The engine's own f16 GEMM for every width: hipBLASLt's plan for the
+  // 6,144-wide output projections ran at about a twelfth of its rate, and
+  // this kernel keeps one K order whatever a token's position in the batch.
+  if (!UnquantizedF16Gemm(wide_w16_, static_cast<const __half*>(s_.x_half), out,
+                          n_tokens, w.rows, w.cols, stream_)) {
+    AssignError(error_msg, "f16 prefill GEMM refused");
     return false;
+  }
   if (w.type == GgmlType::kHT4 && !ht_rotate_output(out, w.sv, n, m, stream_)) {
     AssignError(error_msg, "ht prefill output rotation failed");
     return false;
