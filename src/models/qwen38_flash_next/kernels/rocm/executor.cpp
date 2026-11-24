@@ -1372,6 +1372,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->wide_mixer_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
                    !model.layers().empty() &&
                    model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
+  // q6g64 mixers (halogen v2) take the wide route in wide prefill passes:
+  // F16 norm from the combine, a decoded-f16 GEMM for down (the inject rows
+  // are uploaded as F32, so the epilogue fuses them).
+  e->wide_mixer_q6_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
+                      !model.layers().empty() &&
+                      model.layers()[0].hc_ffn.down.type == GgmlType::kQ6G64;
   if (model.has_mtp()) {
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     // The draft token and its confidence (float bits), one host transfer.
@@ -2515,6 +2521,25 @@ bool Executor::WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
   return true;
 }
 
+bool Executor::WideHgnGemmHalf(const DeviceTensor& w, const __half* x_half, float* out,
+                               std::uint32_t n_tokens, std::string* error_msg) const {
+  const int m = static_cast<int>(w.rows);
+  const int k = static_cast<int>(w.cols);
+  const auto* data = static_cast<const std::uint8_t*>(w.data);
+  const bool ok = w.type == GgmlType::kHT4
+                      ? ht_decode_rotated_f16(data, w.su, w.sv, m, k, wide_w16_, stream_)
+                      : q6g64_decode_f16(data, m, k, wide_w16_, stream_);
+  if (!ok) {
+    AssignError(error_msg, "prefill decode failed");
+    return false;
+  }
+  if (!UnquantizedF16Gemm(wide_w16_, x_half, out, n_tokens, w.rows, w.cols, stream_)) {
+    AssignError(error_msg, "f16 prefill GEMM refused");
+    return false;
+  }
+  return true;
+}
+
 bool Executor::HtDense(const DeviceTensor& w, const float* x, float* out,
                        std::uint32_t n_tokens, std::string* error_msg) const {
   return HtDenseGroup({{&w, out}}, x, n_tokens, error_msg);
@@ -2858,7 +2883,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
   // separate activation pass for the projection.
-  xn_half_ = wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr;
+  xn_half_ = (wide_mixer_ || (wide_mixer_q6_ && WidePrefill(n_tokens) && n_tokens > 32)) &&
+             MatrixRows(n_tokens) && gamma != nullptr;
   xn_q8_ready_ = {};  // s_.xn is rewritten (or left stale) below
   // The next mixer's inject pass reads only the F16 norm written here.
   const float* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
@@ -2904,7 +2930,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     const bool defer_now = defer && c.hc_count == 4;
     res_deferred_ =
         HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma,
-                     s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
+                     s_.xn_half, wide_mixer_q6_ ? nullptr : s_.xn_q8t, n_tokens,
+                     c.hidden_size, c.hc_count,
                      c.rms_eps, stream_, defer_now ? s_.hc_defer_w : nullptr,
                      s_.inject, defer_now ? fused_inject : nullptr);
     if (res_deferred_)
@@ -3010,7 +3037,11 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       return false;
     }
   } else {
-    if (xn_half_) {
+    if (xn_half_ && m.down.type == GgmlType::kQ6G64) {
+      if (!WideHgnGemmHalf(m.down, static_cast<const __half*>(s_.xn_half), s_.lo, n_tokens,
+                           error_msg))
+        return false;
+    } else if (xn_half_) {
       if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
                     m.down.cols, stream_)) {
         AssignError(error_msg, "W8A8 mixer down projection failed");
@@ -3077,7 +3108,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       HcMixEpilogueVec4F16(s_.xn_half, s_.hc_gate,
                            fused_inject ? m.inject.f32() : nullptr, mixed,
                            extras ? static_cast<__half*>(s_.x_half) : nullptr,
-                           extras ? s_.x_q8t : nullptr, inject, n_tokens,
+                           extras && !wide_mixer_q6_ ? s_.x_q8t : nullptr, inject, n_tokens,
                            c.hidden_size, stream_);
     }
     if (extras) {
@@ -3085,7 +3116,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       half_rows_ = n_tokens;
       half_cols_ = c.hidden_size;
       half_bf16_ = false;
-      if (!half_only || !fused_projection) {
+      if ((!half_only || !fused_projection) && !wide_mixer_q6_) {
         q8t_src_ = mixed;
         q8t_rows_ = n_tokens;
         q8t_cols_ = c.hidden_size;
@@ -3112,6 +3143,13 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   if (separate_inject) {
     // A quantized inject projection (the draft block's) reads an F32 norm;
     // on the wide route the combine only produced F16, so norm again.
+    if (xn_half_ && m.inject.type == GgmlType::kQ6G64 && WideHgn(m.inject, n_tokens)) {
+      // q6g64 inject (halogen v2): straight from the F16 norm.
+      if (!WideHgnGemmHalf(m.inject, static_cast<const __half*>(s_.xn_half), inject, n_tokens,
+                           error_msg))
+        return false;
+      return true;
+    }
     if (xn_half_) {
       xn_q8_ready_ = {};
       RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,

@@ -673,6 +673,9 @@ private:
   bool WideHgn(const DeviceTensor& w, std::uint32_t n_tokens) const noexcept;
   bool WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
                    std::uint32_t n_tokens, std::string* error_msg) const;
+  /// WideHgnGemm from rows already in f16 (x_half: [n_tokens][w.cols]).
+  bool WideHgnGemmHalf(const DeviceTensor& w, const __half* x_half, float* out,
+                       std::uint32_t n_tokens, std::string* error_msg) const;
   /// y = W x for a kHT4 matrix read in place (ht_dense.hpp), in launches of
   /// up to eight token rows.
   bool HtDense(const DeviceTensor& w, const float* x, float* out,
@@ -1184,6 +1187,10 @@ private:
   mutable bool half_bf16_{false};
   /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
   mutable bool xn_half_{false};
+  /// Wide mixer route with q6g64 mixer matrices (halogen v2): the combine
+  /// writes the F16 norm only (no tiled Q8 copy) and the mixer's down and
+  /// inject projections read it through WideHgnGemmHalf.
+  bool wide_mixer_q6_{false};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   /// Inject weights whose partials the last combine already wrote to
