@@ -27,6 +27,24 @@ source code, binary content or trace reached the implementation.
 The q6g64 kernel (`src/core/quant/q6g64_dense_kernels.hip.cpp`) was designed
 from the public format alone.
 
+### What the specs did and did not cover
+
+- **From the specs:** the batched routed-expert decode (three launches per
+  MoE layer, device-side selection, last-arriving workgroup finishing, the
+  nibble-to-f16 construction, the shared expert folded into the expert
+  launches) and the ht dense decode (grouped launches, per-workgroup input
+  rotation, band reduction with the output rotation, whole-tile loads with
+  look-ahead, the arithmetic codebook). The ht spec's small-batch figures
+  also motivated the separate verify-batch split plan and the 5- and
+  6-token builds in `ht_dense_kernels.hip.cpp`; the plan itself was chosen
+  by measurement.
+- **Designed on this side, from public sources only:** sharing an expert's
+  weights across the tokens of an MTP verify batch (the `*ShareKernel`
+  launches); all of prefill for these formats, i.e. grouping a chunk's slots
+  by expert, the matrix-core (WMMA) grouped expert kernels, and decoding ht
+  and q6g64 matrices to f16 for a GEMM (`src/core/quant/hgn_prefill*`); the
+  q6g64 kernels; and the hgn2gguf converter. The specs cover decode only.
+
 ## The clean-room process
 
 - **Analysis:** a separate analysis agent studied halogen-flash 0.19 under
