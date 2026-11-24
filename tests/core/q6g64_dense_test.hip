@@ -12,6 +12,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "src/core/quant/hgn_decode.hpp"
@@ -126,6 +127,47 @@ int main() {
       std::printf("%s rows=%d cols=%d n=%d err=%.3e\n", ok ? "PASS" : "FAIL", s.N, s.K, n, e);
       failures += ok ? 0 : 1;
     }
+  }
+  // Verify batches must give bit for bit the single-token results
+  // (speculative decoding must not change greedy output).
+  for (const auto& sh : std::vector<std::pair<int, int>>{{320, 10240}, {10240, 320}}) {
+    const int N = sh.first, K = sh.second;
+    const auto pay = RandomPayload(N, K, rng);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> x(8 * static_cast<std::size_t>(K));
+    for (auto& v : x) v = nd(rng);
+    auto* dw = Up(pay);
+    auto* dx = Up(x);
+    float *d1 = nullptr, *dn = nullptr;
+    HIP_OK(hipMalloc(&d1, 8 * static_cast<std::size_t>(N) * sizeof(float)));
+    HIP_OK(hipMalloc(&dn, 8 * static_cast<std::size_t>(N) * sizeof(float)));
+    for (int t = 0; t < 8; ++t) {
+      Q6g64DenseArgs one{dw, dx + static_cast<std::size_t>(t) * K, d1 + static_cast<std::size_t>(t) * N,
+                         N, K, 1, K, N, nullptr, nullptr, 0, 0};
+      if (!q6g64_dense_gemv(&one, nullptr)) std::exit(2);
+    }
+    std::vector<float> r1(8 * static_cast<std::size_t>(N)), rn(r1.size());
+    HIP_OK(hipDeviceSynchronize());
+    HIP_OK(hipMemcpy(r1.data(), d1, r1.size() * 4, hipMemcpyDeviceToHost));
+    for (int n : {2, 3, 4, 5, 6, 7, 8}) {
+      Q6g64DenseArgs b{dw, dx, dn, N, K, n, K, N, nullptr, nullptr, 0, 0};
+      if (!q6g64_dense_gemv(&b, nullptr)) std::exit(2);
+      HIP_OK(hipDeviceSynchronize());
+      HIP_OK(hipMemcpy(rn.data(), dn, rn.size() * 4, hipMemcpyDeviceToHost));
+      const int diff = [&] {
+        int d = 0;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(n) * N; ++i)
+          d += std::memcmp(&r1[i], &rn[i], 4) != 0;
+        return d;
+      }();
+      std::printf("%s batch of %d rows=%d cols=%d: %d of %d outputs differ from single-token runs\n",
+                  diff == 0 ? "PASS" : "FAIL", n, N, K, diff, n * N);
+      failures += diff == 0 ? 0 : 1;
+    }
+    (void)hipFree(dw);
+    (void)hipFree(dx);
+    (void)hipFree(d1);
+    (void)hipFree(dn);
   }
   std::printf("%s\n", failures == 0 ? "ALL PASS" : "FAILURES");
 

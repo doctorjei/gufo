@@ -1235,10 +1235,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->ht_partial_floats_ = partials;
       e->ht_counter_count_ = counters;
     }
-    // EXPERIMENTAL: GUFO_HT_BATCH_TARGET sets the workgroup target of the ht
-    // verify-batch plan (tuning sweeps).
-    if (const char* v = std::getenv("GUFO_HT_BATCH_TARGET"); v != nullptr)
-      ht_dense_set_batch_target(std::atoi(v));
+    // EXPERIMENTAL: GUFO_HT_MIN_BLOCKS sets the ht split plan's minimum
+    // 128-column blocks per workgroup (one plan at every token count).
+    if (const char* v = std::getenv("GUFO_HT_MIN_BLOCKS"); v != nullptr)
+      ht_dense_set_min_blocks(std::atoi(v));
     // Wide prefill: one f16 copy of the largest kHT4 / kQ6G64 matrix (the
     // output head excluded: prefill only needs its last row, which takes the
     // decode kernel).

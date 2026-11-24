@@ -47,20 +47,17 @@ namespace htdense {
 constexpr int kThreads = 256;
 constexpr int kWave = 32;
 constexpr int kTargetWorkgroups = 640;
-// Verify batches: fewer input splits. Each split's partial sums grow with
-// the token count, while the weights per workgroup do not. Measured on the
-// Flash-Next shapes (ht_dense_test sweep): from 5 tokens every shape is at or
-// near its best with about 7 128-column blocks per workgroup, at 3-4 tokens
-// with about 5; at 2 tokens the single-token plan is best. At least 96
-// workgroups keep the small matrices spread over the GPU.
-// GUFO_HT_BATCH_TARGET (g_batch_target > 0) replaces this with a plain
-// workgroup target, for sweeps.
-int g_batch_target = 0;
-constexpr int kBatchMinWorkgroups = 96;
-
-int MinBlocksPerWorkgroup(int n_tokens) {
-  return n_tokens >= 5 ? 7 : n_tokens >= 3 ? 5 : 0;
-}
+// One plan per matrix shape, the same at every token count: a launch's
+// reduction order then does not depend on the batch, and a verify batch
+// gives bit for bit the single-token results (speculative decoding never
+// changes greedy output). g_min_blocks > 0 asks for at least that many
+// 128-column blocks per workgroup (fewer input splits, cheaper partial sums
+// at verify batch sizes), keeping at least 96 workgroups; 0 is the plan for
+// about 640 workgroups. Default 7: on Loaf (v2 weights) it decodes as fast as
+// the 640-workgroup plan at one token and is the fastest tried for MTP (min
+// blocks 0 / 5 / 7). Set by ht_dense_set_min_blocks / GUFO_HT_MIN_BLOCKS.
+int g_min_blocks = 7;
+constexpr int kMinWorkgroups = 96;
 constexpr int kMaxTokens = 8;
 constexpr int kMaxGroup = HT_DENSE_MAX_GROUP;
 constexpr float kInvSqrt128 = 0.08838834764831845f;
@@ -303,15 +300,13 @@ struct Plan {
   int per;
 };
 
-Plan PlanFor(int rows, int cols, int n_tokens = 1) {
+Plan PlanFor(int rows, int cols) {
   const int bands = rows / 128;
   const int nblk = cols / 128;
   int splits = std::min(nblk, std::max(1, (kTargetWorkgroups + bands - 1) / bands));
-  if (n_tokens > 1 && g_batch_target > 0) {
-    splits = std::min(nblk, std::max(1, (g_batch_target + bands - 1) / bands));
-  } else if (const int min_per = MinBlocksPerWorkgroup(n_tokens); min_per > 0) {
-    const int by_per = (nblk + min_per - 1) / min_per;
-    const int floor = (kBatchMinWorkgroups + bands - 1) / bands;
+  if (g_min_blocks > 0) {
+    const int by_per = (nblk + g_min_blocks - 1) / g_min_blocks;
+    const int floor = (kMinWorkgroups + bands - 1) / bands;
     splits = std::min(splits, std::max(by_per, std::min(floor, nblk)));
   }
   const int per = (nblk + splits - 1) / splits;
@@ -329,15 +324,9 @@ int ht_dense_splits(int rows, int cols) {
   return gufo::quant::htdense::PlanFor(rows, cols).splits;
 }
 
-int ht_dense_splits_for(int rows, int cols, int n_tokens) {
-  return gufo::quant::htdense::PlanFor(rows, cols, n_tokens).splits;
-}
-
-void ht_dense_set_batch_target(int workgroups) {
-  using namespace gufo::quant::htdense;
-  // Never more splits than the single-token plan: the scratch is sized for it.
-  // 0 restores the measured default plan.
-  g_batch_target = workgroups <= 0 ? 0 : (workgroups > kTargetWorkgroups ? kTargetWorkgroups : workgroups);
+void ht_dense_set_min_blocks(int blocks) {
+  // Fewer splits than the default plan only: the scratch is sized for it.
+  gufo::quant::htdense::g_min_blocks = blocks < 0 ? 0 : blocks;
 }
 
 std::size_t ht_dense_partial_floats(int rows, int cols) {
@@ -373,7 +362,7 @@ bool ht_dense_group(const HtGroupArgs* args, hipStream_t stream) {
   for (int i = 0; i < a.count; ++i) {
     const HtMatrix& m = a.m[i];
     if (m.rows <= 0 || m.rows % 128 != 0 || m.codes == nullptr) return false;
-    const Plan p = PlanFor(m.rows, a.cols, a.n_tokens);
+    const Plan p = PlanFor(m.rows, a.cols);
     g.m[i] = m;
     g.splits[i] = p.splits;
     g.per[i] = p.per;

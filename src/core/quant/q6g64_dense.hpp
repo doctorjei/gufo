@@ -8,10 +8,10 @@
 //
 // y[t][r] = sum_g scale_g * (sum_k code_k x_k) + bias_g * (sum_k x_k), in f32.
 //
-// A workgroup owns 32 rows and a slice of the input. Matrices with few rows
-// are split along the input over several workgroups, and the last one to
-// finish a band adds the partial sums (fixed order, deterministic), so they
-// still give hundreds of workgroups.
+// One kernel for every token count (1..8); each token's arithmetic is the
+// same as for a single token, so verify batches give bit for bit the
+// single-token results. The partial-sum scratch is unused (kept in the
+// interface; q6g64_dense_scratch reports 0).
 
 #ifndef GUFO_CORE_QUANT_Q6G64_DENSE_HPP_
 #define GUFO_CORE_QUANT_Q6G64_DENSE_HPP_

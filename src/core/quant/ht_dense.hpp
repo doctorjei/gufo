@@ -70,12 +70,11 @@ void ht_dense_group_scratch(const int* rows, int count, int cols,
                             std::size_t* partials, std::size_t* counters);
 
 /// Input split (workgroups per 128-row band) the launcher uses.
-/// Input splits for a launch of n_tokens rows (verify batches use fewer).
-int ht_dense_splits_for(int rows, int cols, int n_tokens);
-
-/// Replaces the verify-batch plan with a plain workgroup target (at most the
-/// single-token target; 0 restores the default plan). For sweeps.
-void ht_dense_set_batch_target(int workgroups);
+/// The split plan is one per matrix shape, the same at every token count
+/// (verify batches give bit for bit the single-token results). Ask for at
+/// least `blocks` 128-column blocks per workgroup (0 = about 640 workgroups;
+/// the default is 7).
+void ht_dense_set_min_blocks(int blocks);
 
 int ht_dense_splits(int rows, int cols);
 

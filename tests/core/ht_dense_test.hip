@@ -326,18 +326,64 @@ int main() {
       failures += ok ? 0 : 1;
     }
   }
-  // The verify-batch plan with fewer splits must give the same results.
-  ht_dense_set_batch_target(0);
+  // A coarse plan (fewer input splits) must give the same accuracy.
+  ht_dense_set_min_blocks(7);
   for (const auto& s2 : std::vector<std::pair<int, int>>{{640, 2560}, {2560, 6144}, {6144, 2560}}) {
-    for (int n : {2, 5, 8}) {
+    for (int n : {1, 5, 8}) {
       const double e = RunCase(s2.first, s2.second, n, rng, false);
       const bool ok = e < kGate;
-      std::printf("%s batch plan rows=%d cols=%d n=%d splits=%d err=%.3e\n", ok ? "PASS" : "FAIL",
-                  s2.first, s2.second, n, ht_dense_splits_for(s2.first, s2.second, n), e);
+      std::printf("%s coarse plan rows=%d cols=%d n=%d splits=%d err=%.3e\n", ok ? "PASS" : "FAIL",
+                  s2.first, s2.second, n, ht_dense_splits(s2.first, s2.second), e);
       failures += ok ? 0 : 1;
     }
   }
-  ht_dense_set_batch_target(0);
+  ht_dense_set_min_blocks(0);
+  // Verify batches must give bit for bit the single-token results.
+  for (int minb : {0, 7}) {
+    ht_dense_set_min_blocks(minb);
+    for (const auto& s2 : std::vector<std::pair<int, int>>{{10240, 2560}, {2560, 6144}}) {
+      const int R = s2.first, C = s2.second;
+      std::vector<std::uint8_t> codes(static_cast<std::size_t>(R) * C / 2);
+      for (auto& b : codes) b = static_cast<std::uint8_t>(rng());
+      std::vector<float> su(C), sv(R), x(8 * static_cast<std::size_t>(C));
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      for (auto& v : su) v = (rng() & 1) ? 1.0f : -1.0f;
+      for (auto& v : sv) v = 0.01f;
+      for (auto& v : x) v = nd(rng);
+      auto *dc = Up(codes); auto *dsu = Up(su); auto *dsv = Up(sv); auto *dx = Up(x);
+      float *d1 = nullptr, *dn = nullptr, *dp = nullptr;
+      unsigned* dk = nullptr;
+      HIP_OK(hipMalloc(&d1, 8 * static_cast<std::size_t>(R) * 4));
+      HIP_OK(hipMalloc(&dn, 8 * static_cast<std::size_t>(R) * 4));
+      const std::size_t pf = ht_dense_partial_floats(R, C);
+      HIP_OK(hipMalloc(&dp, (pf + 1) * 4));
+      HIP_OK(hipMalloc(&dk, (R / 128 + 1) * sizeof(unsigned)));
+      HIP_OK(hipMemset(dk, 0, (R / 128 + 1) * sizeof(unsigned)));
+      for (int t = 0; t < 8; ++t) {
+        HtDenseArgs one{dc, dsu, dsv, dx + static_cast<std::size_t>(t) * C, d1 + static_cast<std::size_t>(t) * R,
+                        dp, dk, R, C, 1, C, R};
+        if (!ht_dense_gemv(&one, nullptr)) std::exit(2);
+      }
+      HIP_OK(hipDeviceSynchronize());
+      std::vector<float> r1(8 * static_cast<std::size_t>(R)), rn(r1.size());
+      HIP_OK(hipMemcpy(r1.data(), d1, r1.size() * 4, hipMemcpyDeviceToHost));
+      for (int n : {2, 3, 4, 5, 6, 7, 8}) {
+        HtDenseArgs b{dc, dsu, dsv, dx, dn, dp, dk, R, C, n, C, R};
+        if (!ht_dense_gemv(&b, nullptr)) std::exit(2);
+        HIP_OK(hipDeviceSynchronize());
+        HIP_OK(hipMemcpy(rn.data(), dn, rn.size() * 4, hipMemcpyDeviceToHost));
+        int diff = 0;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(n) * R; ++i) diff += std::memcmp(&r1[i], &rn[i], 4) != 0;
+        std::printf("%s min_blocks=%d batch of %d rows=%d cols=%d: %d of %d outputs differ from single-token runs\n",
+                    diff == 0 ? "PASS" : "FAIL", minb, n, R, C, diff, n * R);
+        failures += diff == 0 ? 0 : 1;
+      }
+      for (void* q : {static_cast<void*>(dc), static_cast<void*>(dsu), static_cast<void*>(dsv), static_cast<void*>(dx),
+                      static_cast<void*>(d1), static_cast<void*>(dn), static_cast<void*>(dp), static_cast<void*>(dk)})
+        (void)hipFree(q);
+    }
+  }
+  ht_dense_set_min_blocks(0);
   const double neg = RunCase(640, 2560, 1, rng, true);
   const bool neg_ok = neg > 10 * kGate;
   std::printf("%s negative control err=%.3e\n", neg_ok ? "PASS" : "FAIL", neg);
@@ -394,11 +440,11 @@ int main() {
   HIP_OK(hipEventCreate(&e1));
   // Verify-batch plan sweep: time the batch sizes at several workgroup
   // targets (640 = the single-token plan), then keep the default.
-  for (int target : {0, 640}) {  // 0 = the default batch plan
-    ht_dense_set_batch_target(target);
+  for (int target : {0, 3, 5, 7}) {  // minimum blocks per workgroup; 0 = default plan
+    ht_dense_set_min_blocks(target);
     for (const auto& r : real) {
       if (r.rows > 100000) continue;
-      for (int n : {2, 4, 5, 6, 8}) {
+      for (int n : {1, 2, 4, 5, 8}) {
         HtDenseArgs a{dcodes, dv, dv, dx, dout, dpart, dcnt, r.rows, r.cols, n, r.cols, r.rows};
         for (int i = 0; i < 5; ++i) (void)ht_dense_gemv(&a, nullptr);
         HIP_OK(hipEventRecord(e0, nullptr));
@@ -407,12 +453,12 @@ int main() {
         HIP_OK(hipEventSynchronize(e1));
         float ms = 0.0f;
         HIP_OK(hipEventElapsedTime(&ms, e0, e1));
-        std::printf("SWEEP target=%-3d %-12s n=%d splits=%-2d %8.1f us\n", target, r.name, n,
-                    ht_dense_splits_for(r.rows, r.cols, n), 1000.0 * ms / 200);
+        std::printf("SWEEP min_blocks=%d %-12s n=%d splits=%-2d %8.1f us\n", target, r.name, n,
+                    ht_dense_splits(r.rows, r.cols), 1000.0 * ms / 200);
       }
     }
   }
-  ht_dense_set_batch_target(0);
+  ht_dense_set_min_blocks(0);
   for (const auto& r : real) {
     for (int n : {1, 4, 8}) {
       HtDenseArgs a{dcodes, dv, dv, dx, dout, dpart, dcnt, r.rows, r.cols, n, r.cols, r.rows};
