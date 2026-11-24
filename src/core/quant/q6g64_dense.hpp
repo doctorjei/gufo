@@ -7,12 +7,18 @@
 // bias, code = low | high << 4 in 0..63.
 //
 // y[t][r] = sum_g scale_g * (sum_k code_k x_k) + bias_g * (sum_k x_k), in f32.
+//
+// A workgroup owns 32 rows and a slice of the input. Matrices with few rows
+// are split along the input over several workgroups, and the last one to
+// finish a band adds the partial sums (fixed order, deterministic), so they
+// still give hundreds of workgroups.
 
 #ifndef GUFO_CORE_QUANT_Q6G64_DENSE_HPP_
 #define GUFO_CORE_QUANT_Q6G64_DENSE_HPP_
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 extern "C" {
@@ -26,9 +32,18 @@ struct Q6g64DenseArgs {
   int n_tokens;  ///< 1..8
   int x_stride;
   int out_stride;
+  float* partials;               ///< scratch when the input is split
+  unsigned* counters;            ///< zeroed; reset by each use
+  std::size_t partial_capacity;  ///< floats at partials
+  std::size_t counter_capacity;  ///< counters available
 };
 
-/// Launches y = W x for args->n_tokens (1..8) tokens. False on a bad shape.
+/// Scratch one launch of this shape needs (0 floats when not split).
+void q6g64_dense_scratch(int rows, int cols, std::size_t* partials,
+                         std::size_t* counters);
+
+/// Launches y = W x for args->n_tokens (1..8) tokens. False on a bad shape
+/// or too little scratch.
 bool q6g64_dense_gemv(const Q6g64DenseArgs* args, hipStream_t stream);
 
 }  // extern "C"

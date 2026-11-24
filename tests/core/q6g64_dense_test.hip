@@ -74,11 +74,19 @@ double RunCase(int N, int K, int n, std::mt19937& rng) {
   auto* dx = Up(x);
   float* dout = nullptr;
   HIP_OK(hipMalloc(&dout, static_cast<std::size_t>(n) * N * sizeof(float)));
-  Q6g64DenseArgs a{dw, dx, dout, N, K, n, K, N};
-  if (!q6g64_dense_gemv(&a, nullptr)) {
-    std::printf("launch refused\n");
-    std::exit(2);
-  }
+  std::size_t pf = 0, nc = 0;
+  q6g64_dense_scratch(N, K, &pf, &nc);
+  float* dpart = nullptr;
+  unsigned* dcnt = nullptr;
+  HIP_OK(hipMalloc(&dpart, (pf + 1) * sizeof(float)));
+  HIP_OK(hipMalloc(&dcnt, (nc + 1) * sizeof(unsigned)));
+  HIP_OK(hipMemset(dcnt, 0, (nc + 1) * sizeof(unsigned)));
+  Q6g64DenseArgs a{dw, dx, dout, N, K, n, K, N, dpart, dcnt, pf, nc};
+  for (int rep = 0; rep < 2; ++rep)  // the second run checks counter reset
+    if (!q6g64_dense_gemv(&a, nullptr)) {
+      std::printf("launch refused\n");
+      std::exit(2);
+    }
   HIP_OK(hipDeviceSynchronize());
   std::vector<float> y(static_cast<std::size_t>(n) * N);
   HIP_OK(hipMemcpy(y.data(), dout, y.size() * sizeof(float), hipMemcpyDeviceToHost));
@@ -97,6 +105,8 @@ double RunCase(int N, int K, int n, std::mt19937& rng) {
   (void)hipFree(dw);
   (void)hipFree(dx);
   (void)hipFree(dout);
+  (void)hipFree(dpart);
+  (void)hipFree(dcnt);
   return worst;
 }
 
@@ -132,6 +142,11 @@ int main() {
   float *dlo = nullptr, *dhi = nullptr;
   HIP_OK(hipMalloc(&dlo, 8 * 320 * sizeof(float)));
   HIP_OK(hipMalloc(&dhi, 8 * 10240 * sizeof(float)));
+  float* tpart = nullptr;
+  unsigned* tcnt = nullptr;
+  HIP_OK(hipMalloc(&tpart, 4u << 20));
+  HIP_OK(hipMalloc(&tcnt, 4096 * sizeof(unsigned)));
+  HIP_OK(hipMemset(tcnt, 0, 4096 * sizeof(unsigned)));
   hipEvent_t e0, e1;
   HIP_OK(hipEventCreate(&e0));
   HIP_OK(hipEventCreate(&e1));
@@ -141,8 +156,8 @@ int main() {
       HIP_OK(hipEventRecord(e0, nullptr));
       for (int it = 0; it < 10; ++it) {
         for (int i = 0; i < kMixers; ++i) {
-          Q6g64DenseArgs d{downs[i], dx, dlo, 320, 10240, n, 10240, 320};
-          Q6g64DenseArgs u{ups[i], dlo, dhi, 10240, 320, n, 320, 10240};
+          Q6g64DenseArgs d{downs[i], dx, dlo, 320, 10240, n, 10240, 320, tpart, tcnt, (4u << 20) / 4, 4096};
+          Q6g64DenseArgs u{ups[i], dlo, dhi, 10240, 320, n, 320, 10240, tpart, tcnt, (4u << 20) / 4, 4096};
           (void)q6g64_dense_gemv(&d, nullptr);
           (void)q6g64_dense_gemv(&u, nullptr);
         }

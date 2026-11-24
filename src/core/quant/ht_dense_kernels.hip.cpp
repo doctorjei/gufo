@@ -121,7 +121,7 @@ __device__ __forceinline__ void HtBody(const HtDenseArgs& a, int splits, int per
   const int wave = threadIdx.x / kWave;
   const int xw = per * 128;  // staged values per token
   _Float16* xs = reinterpret_cast<_Float16*>(smem);
-  const int region = max(T * xw * 2, 8 * T * 128 * 4);
+  const int region = max(T * xw * 2, T * 128 * 4);
   float* fin = reinterpret_cast<float*>(smem + region);
 
   // Stage the slice: (x * su) rotated, f16.
@@ -205,20 +205,26 @@ __device__ __forceinline__ void HtBody(const HtDenseArgs& a, int splits, int per
   for (int r = 0; r < 8; ++r)
 #pragma unroll
     for (int t = 0; t < T; ++t) acc[r][t] += __shfl_xor(acc[r][t], 16, kWave);
+  // The 8 waves add into one [T][128] buffer in turn (fixed order, so the
+  // result is deterministic); a per-wave buffer would cost 32 KiB of LDS at
+  // 8 tokens and cap occupancy.
   __syncthreads();
   float* red = reinterpret_cast<float*>(smem);
-  if (lane < 16) {
+  for (int w = 0; w < 8; ++w) {
+    if (wave == w && lane < 16) {
 #pragma unroll
-    for (int r = 0; r < 8; ++r)
+      for (int r = 0; r < 8; ++r)
 #pragma unroll
-      for (int t = 0; t < T; ++t) red[(wave * T + t) * 128 + r * 16 + lane] = acc[r][t];
+        for (int t = 0; t < T; ++t) {
+          float& slot = red[t * 128 + r * 16 + lane];
+          slot = (w == 0) ? acc[r][t] : slot + acc[r][t];
+        }
+    }
+    __syncthreads();
   }
-  __syncthreads();
   for (int i = threadIdx.x; i < T * 128; i += kThreads) {
     const int t = i / 128, r = i % 128;
-    float s = 0.0f;
-#pragma unroll
-    for (int w = 0; w < 8; ++w) s += red[(w * T + t) * 128 + r];
+    const float s = red[t * 128 + r];
     if (splits == 1)
       fin[i] = s;
     else
@@ -338,7 +344,7 @@ bool ht_dense_group(const HtGroupArgs* args, hipStream_t stream) {
     wg += (m.rows / 128) * p.splits;
     if (p.splits > 1) partials += static_cast<std::size_t>(m.rows / 128) * p.splits * kMaxTokens * 128;
     counters += m.rows / 128;
-    const int region = std::max(T * p.per * 128 * 2, 8 * T * 128 * 4);
+    const int region = std::max(T * p.per * 128 * 2, T * 128 * 4);
     lds = std::max(lds, static_cast<std::size_t>(region) + T * 128 * 4);
   }
   g.wg_begin[a.count] = wg;

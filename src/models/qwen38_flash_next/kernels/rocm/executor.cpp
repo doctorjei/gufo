@@ -1191,9 +1191,28 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
               &l.shexp_gate, &l.shexp_up, &l.shexp_down, &l.ple_key,
               &l.ple_value, &l.nextn_fc_embedding, &l.nextn_fc_hidden});
     };
-    for (const auto& layer : model.layers()) note_ht_layer(layer);
+    // q6g64 hyper-connection projections share the same scratch (launches
+    // run in stream order).
+    const auto note_q6 = [&](const DeviceTensor& t) {
+      if (t.empty() || t.type != GgmlType::kQ6G64) return;
+      std::size_t p = 0, n = 0;
+      q6g64_dense_scratch(static_cast<int>(t.rows), static_cast<int>(t.cols), &p, &n);
+      partials = std::max(partials, p);
+      counters = std::max(counters, n);
+      counters = std::max<std::size_t>(counters, 1);
+    };
+    const auto note_q6_mixer = [&](const DeviceMixer& m) {
+      note_q6(m.down);
+      note_q6(m.up);
+    };
+    for (const auto& layer : model.layers()) {
+      note_ht_layer(layer);
+      note_q6_mixer(layer.hc_attn);
+      note_q6_mixer(layer.hc_ffn);
+    }
     if (model.has_mtp()) note_ht_layer(model.mtp());
     sum_ht({&model.output()});
+    note_q6_mixer(model.hc_head());
     if (counters > 0) {
       e->ht_partials_ = Alloc<float>(a, std::max<std::size_t>(partials, 1), error_msg);
       e->ht_counters_ = Alloc<unsigned>(a, counters, error_msg);
@@ -2416,7 +2435,11 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                        static_cast<int>(w.cols),
                        static_cast<int>(n),
                        static_cast<int>(w.cols),
-                       static_cast<int>(w.rows)};
+                       static_cast<int>(w.rows),
+                       ht_partials_,
+                       ht_counters_,
+                       ht_partial_floats_,
+                       ht_counter_count_};
       if (!q6g64_dense_gemv(&a, stream_)) {
         AssignError(error_msg, "q6g64 matrix-vector launch failed");
         return false;
