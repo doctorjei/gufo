@@ -282,14 +282,18 @@ struct Group {
   std::int32_t* cursor = nullptr;
   std::int32_t* slots = nullptr;
   unsigned* counters = nullptr;
+  std::uint16_t* xr_hi = nullptr;
+  std::uint16_t* xr_lo = nullptr;
+  const float* su = nullptr;
 };
 
 void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const float* x,
               const float* weights, float* out, int n_tokens, std::size_t n_experts,
               hipStream_t st, const Group* grp = nullptr) {
   if (grp != nullptr &&
-      !i4r_group_slots(ids, n_tokens * kUsed, static_cast<int>(n_experts), grp->offsets,
-                       grp->cursor, grp->slots, st))
+      (!i4r_group_slots(ids, n_tokens * kUsed, static_cast<int>(n_experts), grp->offsets,
+                        grp->cursor, grp->slots, st) ||
+       !i4r_rotate_expert_input(x, L.su_experts, grp->xr_hi, grp->xr_lo, n_tokens, kHidden, st)))
     std::exit(3);
   I4rGateUpArgs gu{};
   gu.gate = L.gate_new;
@@ -312,6 +316,8 @@ void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const flo
     gu.group_offsets = grp->offsets;
     gu.group_slots = grp->slots;
     gu.group_counters = grp->counters;
+    gu.group_xr_hi = grp->xr_hi;
+    gu.group_xr_lo = grp->xr_lo;
   }
   if (!i4r_fused_gate_up(&gu, n_tokens * kUsed, st)) std::exit(3);
   I4rDownArgs dn{};
@@ -622,11 +628,11 @@ int main(int argc, char** argv) {
   }
 
   // ---- Prefill chunks: slots grouped by expert ----
-  // 256 tokens with random experts (about 5 slots per expert at 512
-  // experts): grouped launches must equal per-token runs bit for bit, and
-  // are timed against the per-slot launches.
-  {
-    constexpr int kP = 256;
+  // 256 and 1,024 tokens with random experts (about 5 and 20 slots per
+  // expert at 512 experts: the dot-product and the matrix-core grouped
+  // kernels), checked against per-token runs and timed against the per-slot
+  // launches.
+  for (const int kP : {256, 1024}) {
     Batch b{};
     b.x = falloc(kP * kHidden);
     b.gate_e = falloc(kP * kUsed * kFf);
@@ -644,6 +650,8 @@ int main(int argc, char** argv) {
     HIP_OK(hipMalloc(&g.slots, kP * kUsed * sizeof(std::int32_t)));
     HIP_OK(hipMalloc(&g.counters, n_exp * (kFf / 128) * sizeof(unsigned)));
     HIP_OK(hipMemset(g.counters, 0, n_exp * (kFf / 128) * sizeof(unsigned)));
+    HIP_OK(hipMalloc(&g.xr_hi, kP * kHidden * sizeof(std::uint16_t)));
+    HIP_OK(hipMalloc(&g.xr_lo, kP * kHidden * sizeof(std::uint16_t)));
     float* ref = falloc(kP * kHidden);
     std::vector<std::int32_t> ids(kP * kUsed), perm(n_exp);
     for (std::size_t i = 0; i < n_exp; ++i) perm[i] = static_cast<std::int32_t>(i);
@@ -666,17 +674,20 @@ int main(int argc, char** argv) {
       RunBatch(layers[0], b, dids + t * kUsed, b.x + t * kHidden, b.weights + t * kUsed,
                ref + t * kHidden, 1, n_exp, st);
     const auto r = Download(ref, kP * kHidden);
-    int mism = 0;
+    // The grouped launches run on the matrix cores: same weights and input
+    // precision, another summation order, so compare with a tolerance (the
+    // split-input gate of the cross-check, 1e-4 of each token's peak).
+    double worst = 0.0;
     for (int rep = 0; rep < 2; ++rep) {  // twice: counters must reset themselves
       RunBatch(layers[0], b, dids, b.x, b.weights, b.out, kP, n_exp, st, &g);
       const auto got = Download(b.out, kP * kHidden);
-      for (std::size_t i = 0; i < r.size(); ++i)
-        mism += std::memcmp(&r[i], &got[i], sizeof(float)) != 0;
+      for (int t = 0; t < kP; ++t)
+        worst = std::max(worst, PeakRel(got, r, static_cast<std::size_t>(t) * kHidden, kHidden));
     }
-    std::printf("prefill chunk of %d tokens, grouped by expert: %d of %zu outputs differ from per-token runs\n",
-                kP, mism, 2 * r.size());
-    if (mism != 0) {
-      std::printf("FAIL: grouped prefill is not bit-identical to per-token runs\n");
+    std::printf("prefill chunk of %d tokens, grouped by expert: worst peak-normalised error vs per-token runs %.3e\n",
+                kP, worst);
+    if (!(worst < 1e-4)) {
+      std::printf("FAIL: grouped prefill exceeds 1e-4 against per-token runs\n");
       ++fails;
     }
     auto time_p = [&](const Group* grp) {

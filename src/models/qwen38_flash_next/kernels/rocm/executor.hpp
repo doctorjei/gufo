@@ -1088,6 +1088,10 @@ private:
   std::int32_t* rot_group_cursor_{nullptr};
   std::int32_t* rot_group_slots_{nullptr};
   unsigned* rot_group_counters_{nullptr};
+  /// Grouped gate+up input, rotated once per layer: f16 hi and lo halves,
+  /// [max_batch x hidden] each.
+  std::uint16_t* rot_group_xr_hi_{nullptr};
+  std::uint16_t* rot_group_xr_lo_{nullptr};
   /// ht kernel scratch: cross-workgroup partial sums and per-band arrival
   /// counters (zeroed; each finishing workgroup resets its counter).
   float* ht_partials_{nullptr};

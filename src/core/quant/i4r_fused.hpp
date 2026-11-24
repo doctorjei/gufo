@@ -56,6 +56,10 @@ struct I4rGateUpArgs {
   const std::int32_t* group_offsets;  ///< [n_experts + 1]
   const std::int32_t* group_slots;    ///< [n_slots], slots ordered by expert
   unsigned* group_counters;           ///< [n_experts x ff/128], zero in and out
+  /// Grouped launches: the rotated input Hn(su_experts * x) per token as f16
+  /// hi and lo halves (i4r_rotate_expert_input), [n_tokens x hidden] each.
+  const std::uint16_t* group_xr_hi;
+  const std::uint16_t* group_xr_lo;
 };
 
 struct I4rDownArgs {
@@ -89,6 +93,11 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots,
 
 /// Launches down + combine for n_tokens tokens.
 bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream);
+
+/// x' = Hn(su * x) per 128-value block as f16 hi + lo halves (the grouped
+/// gate+up input), [n_tokens x hidden] each.
+bool i4r_rotate_expert_input(const float* x, const float* su, std::uint16_t* hi,
+                             std::uint16_t* lo, int n_tokens, int hidden, hipStream_t stream);
 
 /// Groups a batch's slots by expert: offsets[e]..offsets[e+1] index the
 /// slots of expert e in `slots`. cursor is [n_experts] scratch.

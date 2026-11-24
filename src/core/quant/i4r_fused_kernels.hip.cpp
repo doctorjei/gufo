@@ -39,7 +39,10 @@
 //   * Prefill chunks (more than 32 tokens): the slots are first grouped by
 //     expert on the device (i4r_group_slots); GateUpGroupKernel and
 //     DownGroupKernel give each expert its workgroups, which load its codes
-//     once and run through all its slots with the same per-slot arithmetic.
+//     once and run through all its slots. Once experts average 16 slots
+//     the grouped launches run on the matrix cores (GateUpWmmaKernel,
+//     DownWmmaKernel): same weights and input precision, a different
+//     summation order.
 //
 // Rotation contract (unchanged from i4r_kernels.hip.cpp / the RFC):
 //   xr   = Hn(su_experts * x)                  (fused into gate+up's staging)
@@ -842,6 +845,294 @@ __global__ __launch_bounds__(kThreads) void DownGroupKernel(DownArgs a) {
 
 
 // ---------------------------------------------------------------------------
+// Prefill on the matrix cores (WMMA, wave32 f32 += f16 x f16, 16x16x16).
+//
+// A workgroup owns 64 output rows of one expert's matrix (as the grouped
+// kernels above) and runs through the expert's slots 32 at a time. For each
+// 128-value i4r block: the 64 rows' codes are unpacked to f16 (code - 8,
+// exact) into LDS, the 32 tokens' inputs (f16 hi and lo halves) are staged
+// beside them, each wave multiplies one 16-row x 16-token tile over the
+// block's eight K16 steps (hi then lo per step), and the block's sums are
+// scaled in f32 by each row's block scale. So the weights are exact and the
+// inputs keep ~22 bits, as on the dot-product path; only the summation order
+// differs. A token's result does not depend on the other tokens of its tile.
+//
+// Fragment layout (as the engine's dense f16 GEMM): an A or B fragment is
+// one row (token) per lane, lanes l and l + 16 alike, 16 consecutive K
+// halves; accumulator element e of lane l is row 2 e + l / 16, token l % 16.
+// ---------------------------------------------------------------------------
+using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+constexpr int kWmmaTokens = 32;   // tokens per pass
+
+// Grouped launches take the matrix cores once experts average at least 16
+// slots: with fewer the 32-token tiles are mostly empty and the dot-product
+// kernels win (512 experts: 43 against 69 us per token per layer at 256
+// tokens; the matrix cores win at 2,304).
+__host__ __device__ inline bool GroupWmma(int n_slots, int n_experts) {
+  return n_slots >= 16 * n_experts;
+}
+constexpr int kWmmaStride = 136;  // halves per LDS row (128 + 8 against bank conflicts)
+
+struct WmmaLds {
+  _Float16 a[64][kWmmaStride];             // one block of 64 rows
+  _Float16 bh[kWmmaTokens][kWmmaStride];   // input hi halves
+  _Float16 bl[kWmmaTokens][kWmmaStride];   // input lo halves
+  float scale[64];
+};
+
+// Unpacks one i4r block (64 code bytes) of row r into a[r]: quarter q's byte
+// i holds value 16 q + i (low nibble) and 64 + 16 q + i (high nibble).
+__device__ __forceinline__ void StageCodesWmma(WmmaLds& s, const std::uint8_t* codes_row0,
+                                               std::size_t row_codes, int b) {
+  const int tid = threadIdx.x;
+  const int r = tid >> 2, q = tid & 3;
+  const u32x4 v = *reinterpret_cast<const u32x4*>(codes_row0 + r * row_codes + b * 64 + q * 16);
+  const std::uint32_t w[4] = {v[0], v[1], v[2], v[3]};
+  _Float16 lo[16], hi[16];
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const std::uint32_t byte = (w[k] >> (8 * i)) & 0xFFu;
+      lo[4 * k + i] = static_cast<_Float16>(static_cast<int>(byte & 0xFu) - 8);
+      hi[4 * k + i] = static_cast<_Float16>(static_cast<int>(byte >> 4) - 8);
+    }
+  }
+  __builtin_memcpy(&s.a[r][16 * q], lo, 32);
+  __builtin_memcpy(&s.a[r][64 + 16 * q], hi, 32);
+}
+
+// One block's product for this wave's tile, scaled into acc.
+__device__ __forceinline__ void BlockWmma(const WmmaLds& s, int wr, int wt, bool split, v8f& acc) {
+  const int lane = threadIdx.x & (kWave - 1);
+  const int sub = lane & 15, hl = lane >> 4;
+  v8f t = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int kk = 0; kk < 8; ++kk) {
+    v16h fa, fh;
+    __builtin_memcpy(&fa, &s.a[wr * 16 + sub][kk * 16], 32);
+    __builtin_memcpy(&fh, &s.bh[wt * 16 + sub][kk * 16], 32);
+    t = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fa, fh, t);
+    if (split) {
+      v16h fl;
+      __builtin_memcpy(&fl, &s.bl[wt * 16 + sub][kk * 16], 32);
+      t = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fa, fl, t);
+    }
+  }
+#pragma unroll
+  for (int e = 0; e < 8; ++e) acc[e] = fmaf(t[e], s.scale[wr * 16 + 2 * e + hl], acc[e]);
+}
+
+// x' = Hn(su_experts * x) per 128-value block, as f16 hi + lo halves: the
+// grouped gate+up input, rotated once per token per layer.
+__global__ __launch_bounds__(256) void RotateExpertInputKernel(const float* __restrict__ x,
+                                                               const float* __restrict__ su,
+                                                               _Float16* __restrict__ hi,
+                                                               _Float16* __restrict__ lo,
+                                                               int n_blocks, int total) {
+  const int w = blockIdx.x * 8 + threadIdx.x / kWave;
+  if (w >= total) return;
+  const int lane = threadIdx.x & (kWave - 1);
+  const std::size_t base = static_cast<std::size_t>(w / n_blocks) * n_blocks * 128 + (w % n_blocks) * 128;
+  const int b = w % n_blocks;
+  float v[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) v[j] = x[base + lane + 32 * j] * su[b * 128 + lane + 32 * j];
+  Fwht128Wave(v);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const _Float16 h = static_cast<_Float16>(v[j]);
+    hi[base + lane + 32 * j] = h;
+    lo[base + lane + 32 * j] = static_cast<_Float16>(v[j] - static_cast<float>(h));
+  }
+}
+
+// Gate + up, grouped, on the matrix cores. grid.x = n_experts * (2 ff / 64)
+// then the shared-expert range; block r of an expert: tile r / 4, gate/up
+// (bit 1), 64-row half (bit 0), as GateUpGroupKernel.
+template <int NB, bool kSplitInput>
+__global__ __launch_bounds__(kThreads) void GateUpWmmaKernel(GateUpArgs a) {
+  __shared__ __attribute__((aligned(16))) WmmaLds s;
+  const int tiles = a.ff / 128;
+  const int per_expert = tiles * 4;
+  const int routed_wgs = per_expert * static_cast<int>(a.n_experts);
+  if (static_cast<int>(blockIdx.x) >= routed_wgs) {
+    SharedDownRange<kSplitInput>(a, blockIdx.x - routed_wgs, &s.a[0][0], &s.a[1][0]);
+    return;
+  }
+  const int e = blockIdx.x / per_expert;
+  const int r = blockIdx.x % per_expert;
+  const int tile = r >> 2, which = (r >> 1) & 1, half = r & 1;
+  const int off = a.group_offsets[e];
+  const int n_mem = a.group_offsets[e + 1] - off;
+  if (n_mem == 0) return;
+  const int* members = a.group_slots + off;
+  const int tid = threadIdx.x;
+  const int wave = tid / kWave, lane = tid & (kWave - 1);
+  const int wr = wave >> 1, wt = wave & 1;  // 4 row tiles x 2 token tiles
+  const int row0 = tile * 128 + half * 64;
+
+  const std::uint8_t* base = which == 0 ? a.gate : a.up;
+  const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
+  const std::size_t exp_rows = static_cast<std::size_t>(a.ff);
+  const std::uint8_t* codes0 = base + (static_cast<std::size_t>(e) * exp_rows + row0) * row_codes;
+  const __half* scales0 = reinterpret_cast<const __half*>(base + a.n_experts * exp_rows * row_codes) +
+                          (static_cast<std::size_t>(e) * exp_rows + row0) * NB;
+  float* part_base = which == 0 ? a.gate_part : a.up_part;
+  const std::size_t hidden = static_cast<std::size_t>(NB) * 128;
+
+#pragma unroll 1
+  for (int g0 = 0; g0 < n_mem; g0 += kWmmaTokens) {
+    v8f acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll 1
+    for (int b = 0; b < NB; ++b) {
+      if (g0 > 0 || b > 0) __syncthreads();  // the previous block's reads are done
+      StageCodesWmma(s, codes0, row_codes, b);
+      // Inputs: 32 tokens x 128 values, hi and lo; 16 halves per thread.
+      {
+        const int t = tid >> 3, c = (tid & 7) * 16;
+        const int m = g0 + t;
+        u32x4 vh[2] = {u32x4{0, 0, 0, 0}, u32x4{0, 0, 0, 0}}, vl[2] = {vh[0], vh[1]};
+        if (m < n_mem) {
+          const std::size_t src = static_cast<std::size_t>(members[m] / a.used) * hidden + b * 128 + c;
+          vh[0] = *reinterpret_cast<const u32x4*>(a.group_xr_hi + src);
+          vh[1] = *reinterpret_cast<const u32x4*>(a.group_xr_hi + src + 8);
+          if constexpr (kSplitInput) {
+            vl[0] = *reinterpret_cast<const u32x4*>(a.group_xr_lo + src);
+            vl[1] = *reinterpret_cast<const u32x4*>(a.group_xr_lo + src + 8);
+          }
+        }
+        __builtin_memcpy(&s.bh[t][c], vh, 32);
+        if constexpr (kSplitInput) __builtin_memcpy(&s.bl[t][c], vl, 32);
+      }
+      if (tid < 64) s.scale[tid] = __half2float(scales0[tid * NB + b]);
+      __syncthreads();
+      BlockWmma(s, wr, wt, kSplitInput, acc);
+    }
+    // Store: element e is row wr*16 + 2e + lane/16, token wt*16 + lane%16.
+    const int m = g0 + wt * 16 + (lane & 15);
+    if (m < n_mem) {
+      float* p = part_base + static_cast<std::size_t>(members[m]) * a.ff + row0 + wr * 16 + (lane >> 4);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) p[2 * k] = acc[k];
+    }
+  }
+
+  if (!LastArrival(a.group_counters + e * tiles + tile, 4u)) return;
+  if (tid >= kWave) return;
+  // Finisher as in GateUpMembers: SwiGLU and the down-input rotation per slot.
+#pragma unroll 1
+  for (int m = 0; m < n_mem; ++m) {
+    const int ms = members[m];
+    float* gp = a.gate_part + static_cast<std::size_t>(ms) * a.ff + tile * 128;
+    const float* up = a.up_part + static_cast<std::size_t>(ms) * a.ff + tile * 128;
+    float g[4], u[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      g[j] = LoadPartial(gp + lane + 32 * j);
+      u[j] = LoadPartial(up + lane + 32 * j);
+    }
+    Fwht128Wave(g);
+    Fwht128Wave(u);
+    float h[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int i = tile * 128 + lane + 32 * j;
+      h[j] = Silu(g[j] * a.sv_gate[i]) * (u[j] * a.sv_up[i]) * a.su_down[i];
+    }
+    Fwht128Wave(h);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) gp[lane + 32 * j] = h[j];
+  }
+}
+
+// Down, grouped, on the matrix cores. grid.x = n_experts * (hidden / 128) * 2.
+template <int NB, bool kSplitInput>
+__global__ __launch_bounds__(kThreads) void DownWmmaKernel(DownArgs a) {
+  __shared__ __attribute__((aligned(16))) WmmaLds s;
+  const int tiles = a.hidden / 128;
+  const int per_expert = tiles * 2;
+  const int e = blockIdx.x / per_expert;
+  const int r = blockIdx.x % per_expert;
+  const int tile = r >> 1, half = r & 1;
+  const int off = a.group_offsets[e];
+  const int n_mem = a.group_offsets[e + 1] - off;
+  if (n_mem == 0) return;
+  const int* members = a.group_slots + off;
+  const int tid = threadIdx.x;
+  const int wave = tid / kWave, lane = tid & (kWave - 1);
+  const int wr = wave >> 1, wt = wave & 1;
+  const int row0 = tile * 128 + half * 64;
+  constexpr int kIn = NB * 128;
+
+  const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
+  const std::size_t exp_rows = static_cast<std::size_t>(a.hidden);
+  const std::uint8_t* codes0 = a.down + (static_cast<std::size_t>(e) * exp_rows + row0) * row_codes;
+  const __half* scales0 = reinterpret_cast<const __half*>(a.down + a.n_experts * exp_rows * row_codes) +
+                          (static_cast<std::size_t>(e) * exp_rows + row0) * NB;
+
+#pragma unroll 1
+  for (int g0 = 0; g0 < n_mem; g0 += kWmmaTokens) {
+    v8f acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll 1
+    for (int b = 0; b < NB; ++b) {
+      if (g0 > 0 || b > 0) __syncthreads();
+      StageCodesWmma(s, codes0, row_codes, b);
+      // Inputs (f32 down inputs, already rotated): hi/lo split on the way in.
+      {
+        const int t = tid >> 3, c = (tid & 7) * 16;
+        const int m = g0 + t;
+        float v[16];
+        if (m < n_mem) {
+          const float4* src = reinterpret_cast<const float4*>(
+              a.down_in + static_cast<std::size_t>(members[m]) * kIn + b * 128 + c);
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const float4 f = src[i];
+            v[4 * i] = f.x;
+            v[4 * i + 1] = f.y;
+            v[4 * i + 2] = f.z;
+            v[4 * i + 3] = f.w;
+          }
+        } else {
+#pragma unroll
+          for (int i = 0; i < 16; ++i) v[i] = 0.0f;
+        }
+        _Float16 hh[16], ll[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          hh[i] = static_cast<_Float16>(v[i]);
+          ll[i] = static_cast<_Float16>(v[i] - static_cast<float>(hh[i]));
+        }
+        __builtin_memcpy(&s.bh[t][c], hh, 32);
+        if constexpr (kSplitInput) __builtin_memcpy(&s.bl[t][c], ll, 32);
+      }
+      if (tid < 64) s.scale[tid] = __half2float(scales0[tid * NB + b]);
+      __syncthreads();
+      BlockWmma(s, wr, wt, kSplitInput, acc);
+    }
+    const int m = g0 + wt * 16 + (lane & 15);
+    if (m < n_mem) {
+      float* p = a.down_part + static_cast<std::size_t>(members[m]) * a.hidden + row0 + wr * 16 + (lane >> 4);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) p[2 * k] = acc[k];
+    }
+  }
+
+  // One arrival per slot's token tile (two per slot, one per half); the last
+  // to arrive at a token's tile combines it.
+  const int per_tile = a.used * 2;
+#pragma unroll 1
+  for (int m = 0; m < n_mem; ++m) {
+    const int mt = members[m] / a.used;
+    const bool last = LastArrival(a.counters + mt * tiles + tile, static_cast<unsigned>(per_tile));
+    if (last && tid < kWave) Combine(a, mt, tile);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Slot grouping for prefill: offsets[e + 1] counts the slots that selected
 // expert e, an exclusive scan turns counts into offsets, and a scatter writes
 // each slot at its expert's cursor. The order within an expert depends on
@@ -927,6 +1218,10 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
     wgs += static_cast<unsigned>(a.n_tokens) * (a.hidden / 128u) * (a.shared_ff / 128u);
   }
   const bool group = a.group_offsets != nullptr;
+  const bool wmma =
+      group && gufo::quant::fused::GroupWmma(n_slots, static_cast<int>(a.n_experts));
+  if (wmma && (a.group_xr_hi == nullptr || (!a.plain_f16 && a.group_xr_lo == nullptr)))
+    return false;
   if (group) wgs = static_cast<unsigned>(a.n_experts) * (2u * a.ff / 64u) +
                    (wgs - static_cast<unsigned>(n_slots) * (2u * a.ff / 64u));
   const dim3 grid(wgs);
@@ -934,7 +1229,11 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
   switch (a.hidden / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
-    if (group && a.plain_f16)                                                \
+    if (group && wmma && a.plain_f16)                                        \
+      gufo::quant::fused::GateUpWmmaKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
+    else if (group && wmma)                                                  \
+      gufo::quant::fused::GateUpWmmaKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
+    else if (group && a.plain_f16)                                           \
       gufo::quant::fused::GateUpGroupKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else if (group)                                                          \
       gufo::quant::fused::GateUpGroupKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
@@ -965,13 +1264,19 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
   const I4rDownArgs& a = *args;
   if (a.ff % 128 != 0 || a.hidden % 128 != 0 || n_tokens <= 0) return false;
   const bool group = a.group_offsets != nullptr;
+  const bool wmma = group && gufo::quant::fused::GroupWmma(n_tokens * a.used,
+                                                           static_cast<int>(a.n_experts));
   const dim3 grid(group ? static_cast<unsigned>(a.n_experts) * (a.hidden / 128u) * 2u
                         : static_cast<unsigned>(n_tokens) * (a.hidden / 128u) * a.used * 2u);
   const bool share = !group && gufo::quant::fused::ShareExperts(n_tokens, n_tokens * a.used);
   switch (a.ff / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
-    if (group && a.plain_f16)                                                \
+    if (group && wmma && a.plain_f16)                                        \
+      gufo::quant::fused::DownWmmaKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
+    else if (group && wmma)                                                  \
+      gufo::quant::fused::DownWmmaKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
+    else if (group && a.plain_f16)                                           \
       gufo::quant::fused::DownGroupKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else if (group)                                                          \
       gufo::quant::fused::DownGroupKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
@@ -995,6 +1300,16 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
     default:
       return false;
   }
+}
+
+bool i4r_rotate_expert_input(const float* x, const float* su, std::uint16_t* hi,
+                             std::uint16_t* lo, int n_tokens, int hidden, hipStream_t stream) {
+  if (n_tokens <= 0 || hidden <= 0 || hidden % 128 != 0) return false;
+  const int total = n_tokens * (hidden / 128);
+  gufo::quant::fused::RotateExpertInputKernel<<<static_cast<unsigned>((total + 7) / 8), 256, 0,
+                                                stream>>>(
+      x, su, reinterpret_cast<_Float16*>(hi), reinterpret_cast<_Float16*>(lo), hidden / 128, total);
+  return hipGetLastError() == hipSuccess;
 }
 
 bool i4r_group_slots(const std::int32_t* ids, int n_slots, int n_experts,

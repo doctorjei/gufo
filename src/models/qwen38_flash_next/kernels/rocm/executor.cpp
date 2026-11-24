@@ -1169,6 +1169,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->rot_group_slots_ = Alloc<std::int32_t>(a, slots, error_msg);
       e->rot_group_counters_ =
           Alloc<unsigned>(a, std::size_t{c.num_experts} * (c.expert_ff / 128), error_msg);
+      e->rot_group_xr_hi_ = Alloc<std::uint16_t>(a, std::size_t{T} * c.hidden_size, error_msg);
+      e->rot_group_xr_lo_ = Alloc<std::uint16_t>(a, std::size_t{T} * c.hidden_size, error_msg);
+      if (e->rot_group_xr_hi_ == nullptr || e->rot_group_xr_lo_ == nullptr) return nullptr;
       if (e->rot_group_offsets_ == nullptr || e->rot_group_cursor_ == nullptr ||
           e->rot_group_slots_ == nullptr || e->rot_group_counters_ == nullptr)
         return nullptr;
@@ -3964,8 +3967,11 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // read once per chunk (the per-token arithmetic is unchanged).
     const bool grouped = I4rGroupedBatch(n_tokens, used) && rot_group_slots_ != nullptr;
     if (grouped &&
-        !i4r_group_slots(s_.ids, static_cast<int>(slots), static_cast<int>(c.num_experts),
-                         rot_group_offsets_, rot_group_cursor_, rot_group_slots_, stream_)) {
+        (!i4r_group_slots(s_.ids, static_cast<int>(slots), static_cast<int>(c.num_experts),
+                          rot_group_offsets_, rot_group_cursor_, rot_group_slots_, stream_) ||
+         !i4r_rotate_expert_input(x, l.rot_su_experts.f32(), rot_group_xr_hi_, rot_group_xr_lo_,
+                                  static_cast<int>(n_tokens), static_cast<int>(c.hidden_size),
+                                  stream_))) {
       AssignError(error_msg, "rotated expert grouping launch failed");
       return false;
     }
@@ -3991,6 +3997,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       gu.group_offsets = rot_group_offsets_;
       gu.group_slots = rot_group_slots_;
       gu.group_counters = rot_group_counters_;
+      gu.group_xr_hi = rot_group_xr_hi_;
+      gu.group_xr_lo = rot_group_xr_lo_;
     }
     if (l.shexp_split) {
       if (l.shexp_down.cols / 128 > used) {
