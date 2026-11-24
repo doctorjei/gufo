@@ -265,6 +265,32 @@ double RunWide(int rows, int cols, int n, std::mt19937& rng) {
   return worst;
 }
 
+// ht_decode_rotated_f16 (rotations folded into the weights) against the CPU
+// decoder, element by element, relative to the largest weight.
+double RunFolded(int rows, int cols, std::mt19937& rng) {
+  const Mat m = MakeMat(rows, cols, rng);
+  auto* dcodes = Up(m.codes);
+  auto* dsu = Up(m.su);
+  auto* dsv = Up(m.sv);
+  _Float16* dw = nullptr;
+  HIP_OK(hipMalloc(&dw, static_cast<std::size_t>(rows) * cols * 2));
+  if (!ht_decode_rotated_f16(dcodes, dsu, dsv, rows, cols, dw, nullptr)) {
+    std::printf("folded decode refused\n");
+    std::exit(2);
+  }
+  std::vector<_Float16> got(static_cast<std::size_t>(rows) * cols);
+  HIP_OK(hipMemcpy(got.data(), dw, got.size() * 2, hipMemcpyDeviceToHost));
+  double peak = 0.0, emax = 0.0;
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    peak = std::max(peak, std::fabs(static_cast<double>(m.w[i])));
+    emax = std::max(emax, std::fabs(static_cast<double>(m.w[i]) - static_cast<double>(got[i])));
+  }
+  for (void* p : {static_cast<void*>(dcodes), static_cast<void*>(dsu), static_cast<void*>(dsv),
+                  static_cast<void*>(dw)})
+    (void)hipFree(p);
+  return emax / peak;
+}
+
 // q6g64_decode_f16 against the CPU decoder: max error over all values,
 // relative to the largest value.
 double RunQ6Decode(int rows, int cols, std::mt19937& rng) {
@@ -402,6 +428,14 @@ int main() {
     const bool ok = e < kGate;
     std::printf("%s wide prefill rows=%d cols=%d n=24 err=%.3e\n", ok ? "PASS" : "FAIL", s.first,
                 s.second, e);
+    failures += ok ? 0 : 1;
+  }
+  for (const auto& s2 : std::vector<std::pair<int, int>>{{640, 2560}, {2560, 6144}, {512, 2560}}) {
+    // f16 rounding of the folded weights: below 1e-3 of the largest weight.
+    const double e = RunFolded(s2.first, s2.second, rng);
+    const bool ok = e < 1e-3;
+    std::printf("%s folded ht decode rows=%d cols=%d err=%.3e\n", ok ? "PASS" : "FAIL", s2.first,
+                s2.second, e);
     failures += ok ? 0 : 1;
   }
   {

@@ -1172,6 +1172,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->rot_group_xr_hi_ = Alloc<std::uint16_t>(a, std::size_t{T} * c.hidden_size, error_msg);
       e->rot_group_xr_lo_ = Alloc<std::uint16_t>(a, std::size_t{T} * c.hidden_size, error_msg);
       if (e->rot_group_xr_hi_ == nullptr || e->rot_group_xr_lo_ == nullptr) return nullptr;
+      e->rot_group_items_ = Alloc<std::int64_t>(
+          a, static_cast<std::size_t>(i4r_prefill_max_tiles(static_cast<int>(slots),
+                                                            static_cast<int>(c.num_experts))),
+          error_msg);
+      e->rot_group_n_items_ = Alloc<std::int32_t>(a, 1, error_msg);
+      if (e->rot_group_items_ == nullptr || e->rot_group_n_items_ == nullptr) return nullptr;
       if (e->rot_group_offsets_ == nullptr || e->rot_group_cursor_ == nullptr ||
           e->rot_group_slots_ == nullptr || e->rot_group_counters_ == nullptr)
         return nullptr;
@@ -2481,26 +2487,22 @@ bool Executor::WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
   const int n = static_cast<int>(n_tokens);
   const auto* data = static_cast<const std::uint8_t*>(w.data);
   if (w.type == GgmlType::kHT4) {
-    // x_half now holds this matrix's rotated input, not the plain rows.
-    half_src_ = nullptr;
-    if (!ht_decode_f16(data, m, k, wide_w16_, stream_) ||
-        !ht_rotate_input_f16(x, w.su, s_.x_half, n, k, stream_)) {
-      AssignError(error_msg, "ht prefill decode or input rotation failed");
+    // The rotations are folded into the decoded weights, so the GEMM takes
+    // the plain f16 rows (shared by matrices that read the same input).
+    if (!ht_decode_rotated_f16(data, w.su, w.sv, m, k, wide_w16_, stream_)) {
+      AssignError(error_msg, "ht prefill decode failed");
       return false;
     }
-  } else {
-    if (!q6g64_decode_f16(data, m, k, wide_w16_, stream_)) {
-      AssignError(error_msg, "q6g64 prefill decode failed");
-      return false;
-    }
-    if (!(half_src_ == x && half_rows_ == n_tokens && half_cols_ == w.cols &&
-          !half_bf16_)) {
-      NarrowActivations(x, s_.x_half, false, static_cast<std::size_t>(n) * k, stream_);
-      half_src_ = x;
-      half_rows_ = n_tokens;
-      half_cols_ = w.cols;
-      half_bf16_ = false;
-    }
+  } else if (!q6g64_decode_f16(data, m, k, wide_w16_, stream_)) {
+    AssignError(error_msg, "q6g64 prefill decode failed");
+    return false;
+  }
+  if (!(half_src_ == x && half_rows_ == n_tokens && half_cols_ == w.cols && !half_bf16_)) {
+    NarrowActivations(x, s_.x_half, false, static_cast<std::size_t>(n) * k, stream_);
+    half_src_ = x;
+    half_rows_ = n_tokens;
+    half_cols_ = w.cols;
+    half_bf16_ = false;
   }
   // The engine's own f16 GEMM for every width: hipBLASLt's plan for the
   // 6,144-wide output projections ran at about a twelfth of its rate, and
@@ -2508,10 +2510,6 @@ bool Executor::WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
   if (!UnquantizedF16Gemm(wide_w16_, static_cast<const __half*>(s_.x_half), out,
                           n_tokens, w.rows, w.cols, stream_)) {
     AssignError(error_msg, "f16 prefill GEMM refused");
-    return false;
-  }
-  if (w.type == GgmlType::kHT4 && !ht_rotate_output(out, w.sv, n, m, stream_)) {
-    AssignError(error_msg, "ht prefill output rotation failed");
     return false;
   }
   return true;
@@ -3975,7 +3973,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                           rot_group_offsets_, rot_group_cursor_, rot_group_slots_, stream_) ||
          !i4r_rotate_expert_input(x, l.rot_su_experts.f32(), rot_group_xr_hi_, rot_group_xr_lo_,
                                   static_cast<int>(n_tokens), static_cast<int>(c.hidden_size),
-                                  stream_))) {
+                                  stream_) ||
+         !i4r_prefill_tiles(rot_group_offsets_, static_cast<int>(c.num_experts), rot_group_items_,
+                            rot_group_n_items_, stream_))) {
       AssignError(error_msg, "rotated expert grouping launch failed");
       return false;
     }
@@ -4003,6 +4003,10 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       gu.group_counters = rot_group_counters_;
       gu.group_xr_hi = rot_group_xr_hi_;
       gu.group_xr_lo = rot_group_xr_lo_;
+      gu.group_items = rot_group_items_;
+      gu.group_n_items = rot_group_n_items_;
+      gu.group_max_items =
+          i4r_prefill_max_tiles(static_cast<int>(slots), static_cast<int>(c.num_experts));
     }
     if (l.shexp_split) {
       if (l.shexp_down.cols / 128 > used) {
@@ -4044,6 +4048,10 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     if (grouped) {
       dn.group_offsets = rot_group_offsets_;
       dn.group_slots = rot_group_slots_;
+      dn.group_items = rot_group_items_;
+      dn.group_n_items = rot_group_n_items_;
+      dn.group_max_items =
+          i4r_prefill_max_tiles(static_cast<int>(slots), static_cast<int>(c.num_experts));
     }
     if (!i4r_fused_down(&dn, static_cast<int>(n_tokens), stream_)) {
       AssignError(error_msg, "rotated down launch has no instantiation");

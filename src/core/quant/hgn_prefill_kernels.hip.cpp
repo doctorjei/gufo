@@ -79,6 +79,88 @@ __global__ __launch_bounds__(256) void HtDecodeF16Kernel(const std::uint32_t* __
   *reinterpret_cast<u32x4*>(dst) = u32x4{h[0], h[1], h[2], h[3]};
 }
 
+// The full ht weights W = diag(sv) . Hn . M . Hn . diag(su) / 128 as f16,
+// one workgroup per 128 x 128 block (band, column block). Each wave decodes
+// one 16-column tile column (all 8 row tiles; the 16 word loads are issued
+// before any decoding) and the block's codebook values (exact in f16) go to an
+// f16 LDS tile. Each row then gets the column-side 128-point transform in
+// f32 (rounded back to f16 in LDS), each column the row-side transform, and
+// sv[r] * su[c] scales the result before the f16 store. The tile is 32 KiB
+// (several workgroups per compute unit) and XOR-swizzled (column ^ row % 32
+// on 2-byte elements, in pairs) against bank conflicts on both passes.
+__device__ __forceinline__ int Sw(int r, int c) { return r * 128 + (c ^ ((r & 31) << 1)); }
+
+__global__ __launch_bounds__(256) void HtDecodeRotatedKernel(const std::uint32_t* __restrict__ words,
+                                                             const float* __restrict__ su,
+                                                             const float* __restrict__ sv, int cols,
+                                                             _Float16* __restrict__ out) {
+  __shared__ _Float16 tile[128 * 128];  // 32 KiB
+  const int nblk = cols / 128;
+  const int band = blockIdx.x / nblk;
+  const int cb = blockIdx.x % nblk;
+  const int col_tiles = cols / 16;
+  const int wave = threadIdx.x / kWave;
+  const int lane = threadIdx.x & (kWave - 1);
+  {
+    const int ct = cb * 8 + wave;
+    const std::uint32_t* t0 = words + ((static_cast<std::size_t>(band) * col_tiles + ct) * 8) * 32;
+    std::uint32_t cur[8], prv[8];
+#pragma unroll
+    for (int rt = 0; rt < 8; ++rt) {
+      cur[rt] = __builtin_nontemporal_load(t0 + rt * 32 + lane);
+      prv[rt] = t0[rt * 32 + ((lane + kWave - 1) & (kWave - 1))];
+    }
+    const int c0 = wave * 16 + 8 * (lane >> 4);
+#pragma unroll
+    for (int rt = 0; rt < 8; ++rt) {
+      const std::uint64_t v = (static_cast<std::uint64_t>(prv[rt]) << 32) | cur[rt];
+      const int r = rt * 16 + (lane & 15);
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const std::uint32_t s0 = static_cast<std::uint32_t>(v >> (28 - 8 * k)) & 0xFFFFu;
+        const std::uint32_t s1 = static_cast<std::uint32_t>(v >> (24 - 8 * k)) & 0xFFFFu;
+        *reinterpret_cast<half2_t*>(&tile[Sw(r, c0 + 2 * k)]) = Codebook2(s0, s1);
+      }
+    }
+  }
+  __syncthreads();
+  // Column-side transform: each row's 128 values (f32 in registers).
+#pragma unroll 1
+  for (int r = wave; r < 128; r += 8) {
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = static_cast<float>(tile[Sw(r, lane + 32 * j)]);
+    Fwht128Wave(v);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) tile[Sw(r, lane + 32 * j)] = static_cast<_Float16>(v[j]);
+  }
+  __syncthreads();
+  // Row-side transform per column and the scales, back into the tile.
+#pragma unroll 1
+  for (int c = wave; c < 128; c += 8) {
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = static_cast<float>(tile[Sw(lane + 32 * j, c)]);
+    Fwht128Wave(v);
+    const float scol = su[cb * 128 + c];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int r = lane + 32 * j;
+      tile[Sw(r, c)] = static_cast<_Float16>(v[j] * sv[band * 128 + r] * scol);
+    }
+  }
+  __syncthreads();
+  // Coalesced stores: each wave writes whole rows (lane l: columns 4l..4l+3).
+#pragma unroll 1
+  for (int r = wave; r < 128; r += 8) {
+    const half2_t a0 = *reinterpret_cast<const half2_t*>(&tile[Sw(r, 4 * lane)]);
+    const half2_t a1 = *reinterpret_cast<const half2_t*>(&tile[Sw(r, 4 * lane + 2)]);
+    _Float16* dst = out + static_cast<std::size_t>(band * 128 + r) * cols + cb * 128 + 4 * lane;
+    *reinterpret_cast<half2_t*>(dst) = a0;
+    *reinterpret_cast<half2_t*>(dst + 2) = a1;
+  }
+}
+
 // One wave per (token, 128-value block); 8 waves a workgroup.
 __global__ __launch_bounds__(256) void HtRotateInputKernel(const float* __restrict__ x,
                                                            const float* __restrict__ su,
@@ -176,6 +258,16 @@ bool ht_decode_f16(const std::uint8_t* codes, int rows, int cols, void* out,
   const unsigned grid = static_cast<unsigned>(rows / 128) * static_cast<unsigned>(cols / 16);
   HtDecodeF16Kernel<<<grid, 256, 0, stream>>>(reinterpret_cast<const std::uint32_t*>(codes),
                                               cols, static_cast<_Float16*>(out));
+  return hipGetLastError() == hipSuccess;
+}
+
+bool ht_decode_rotated_f16(const std::uint8_t* codes, const float* su, const float* sv, int rows,
+                           int cols, void* out, hipStream_t stream) {
+  using namespace gufo::quant::hgn_prefill;
+  if (rows <= 0 || cols <= 0 || rows % 128 != 0 || cols % 128 != 0) return false;
+  const unsigned grid = static_cast<unsigned>(rows / 128) * static_cast<unsigned>(cols / 128);
+  HtDecodeRotatedKernel<<<grid, 256, 0, stream>>>(
+      reinterpret_cast<const std::uint32_t*>(codes), su, sv, cols, static_cast<_Float16*>(out));
   return hipGetLastError() == hipSuccess;
 }
 

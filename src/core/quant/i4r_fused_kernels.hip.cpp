@@ -42,7 +42,10 @@
 //     once and run through all its slots. Once experts average 16 slots
 //     the grouped launches run on the matrix cores (GateUpWmmaKernel,
 //     DownWmmaKernel): same weights and input precision, a different
-//     summation order. Grouped down launches only write each slot's
+//     summation order. With a tile work list (i4r_prefill_tiles) the
+//     matrix-core launches are GateUpPrefillKernel / DownPrefillKernel:
+//     64-token x 256-row tiles, single-pass f16 inputs and weights.
+//     Grouped down launches only write each slot's
 //     output; a separate CombineKernel pass does the weighted combine.
 //
 // Rotation contract (unchanged from i4r_kernels.hip.cpp / the RFC):
@@ -1139,6 +1142,254 @@ __global__ __launch_bounds__(256) void CombineKernel(DownArgs a, int total) {
 }
 
 // ---------------------------------------------------------------------------
+// Prefill v2: 64-token tiles from a work list, on the matrix cores.
+//
+// After i4r_group_slots, i4r_prefill_tiles lists every 64-token tile of
+// every expert (expert, first slot index). A workgroup takes one tile and a
+// 256-row block of the expert's matrix: for gate and up, 128 gate rows and the
+// matching 128 up rows (so it also runs the finisher for its 128-row tile,
+// with no arrival counters); for down, 256 output rows. Grids come from an
+// upper bound on the tile count (n_experts + slots / 64); workgroups past the
+// listed tiles exit at once.
+//
+// Single-pass f16: the 4-bit codes and their block scale are decoded to f16
+// ((code - 8) * scale, rounded) straight into matrix fragments, the inputs are
+// f16, products accumulate in f32 (wave32 16x16x16 WMMA). Each wave owns two
+// 16-row tiles and the four 16-token tiles of the workgroup.
+// ---------------------------------------------------------------------------
+constexpr int kTileTokens = 64;
+constexpr int kTileRows = 256;
+constexpr int kBStride = 136;  // halves per staged token row (128 + 8)
+
+struct PrefillLds {
+  _Float16 b[kTileTokens][kBStride];
+};
+
+// Sixteen f16 weights (one K16 step of one row) from 16 code bytes: the low
+// nibbles (values 16q..16q+15 of the block) or the high nibbles (64+16q..).
+__device__ __forceinline__ v16h DecodeK16(u32x4 c, bool high, half2_t scale2) {
+  const half2_t bias = AsHalf2(0x64086408u);  // 1032 = 1024 + 8
+  v16h f;
+  half2_t* h = reinterpret_cast<half2_t*>(&f);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const std::uint32_t t = (high ? (c[k] >> 4) : c[k]) & 0x0F0F0F0Fu;
+    const std::uint32_t p01 = (t & 0xFFu) | ((t & 0xFF00u) << 8);
+    const std::uint32_t p23 = ((t >> 16) & 0xFFu) | ((t >> 8) & 0xFF0000u);
+    h[2 * k] = (AsHalf2(p01 | 0x64006400u) - bias) * scale2;
+    h[2 * k + 1] = (AsHalf2(p23 | 0x64006400u) - bias) * scale2;
+  }
+  return f;
+}
+
+// One 128-value block: this wave's two row tiles against the four staged
+// token tiles. codes_row[i] points at row tile i's row for this lane.
+__device__ __forceinline__ void PrefillBlock(const PrefillLds& s, const std::uint8_t* const codes_row[2],
+                                             const __half* const scale_row[2], int b, int NB,
+                                             v8f acc[2][4]) {
+  const int lane = threadIdx.x & (kWave - 1);
+  u32x4 c[2][4];
+  half2_t sc[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q)
+      c[i][q] = __builtin_nontemporal_load(reinterpret_cast<const u32x4*>(codes_row[i] + b * 64 + q * 16));
+    const _Float16 s1 = __builtin_bit_cast(_Float16, scale_row[i][b]);
+    sc[i] = half2_t{s1, s1};
+  }
+  (void)NB;
+#pragma unroll
+  for (int kk = 0; kk < 8; ++kk) {
+    v16h fb[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) __builtin_memcpy(&fb[j], &s.b[j * 16 + (lane & 15)][kk * 16], 32);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const v16h fa = DecodeK16(c[i][kk & 3], kk >= 4, sc[i]);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fa, fb[j], acc[i][j]);
+    }
+  }
+}
+
+__global__ void BuildTilesKernel(const std::int32_t* __restrict__ offsets, int n_experts,
+                                 int2* __restrict__ items, std::int32_t* __restrict__ n_items) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  int k = 0;
+  for (int e = 0; e < n_experts; ++e)
+    for (int s = offsets[e]; s < offsets[e + 1]; s += kTileTokens) items[k++] = make_int2(e, s);
+  *n_items = k;
+}
+
+// Gate + up, prefill v2. grid.x = (ff / 128) * max_items.
+template <int NB>
+__global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
+  __shared__ __attribute__((aligned(16))) PrefillLds s;
+  const int tiles = a.ff / 128;
+  const int routed_wgs = tiles * a.group_max_items;
+  if (static_cast<int>(blockIdx.x) >= routed_wgs) {  // the shared-expert down range
+    SharedDownRange<true>(a, blockIdx.x - routed_wgs, &s.b[0][0], &s.b[1][0]);
+    return;
+  }
+  const int item = blockIdx.x / tiles;
+  const int tile = blockIdx.x % tiles;
+  if (item >= *a.group_n_items) return;
+  const int2 it = static_cast<const int2*>(a.group_items)[item];
+  const int e = it.x, first = it.y;
+  const int end = min(first + kTileTokens, a.group_offsets[e + 1]);
+  const int n_tok = end - first;
+  const int tid = threadIdx.x, wave = tid / kWave, lane = tid & (kWave - 1);
+  const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
+  const std::size_t exp_rows = static_cast<std::size_t>(a.ff);
+  // Wave w: row tiles 2w, 2w+1 of the 256 rows (0-127 gate, 128-255 up).
+  const std::uint8_t* codes_row[2];
+  const __half* scale_row[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int r256 = (2 * wave + i) * 16 + (lane & 15);
+    const std::uint8_t* base = r256 < 128 ? a.gate : a.up;
+    const std::size_t row = static_cast<std::size_t>(e) * exp_rows + tile * 128 + (r256 & 127);
+    codes_row[i] = base + row * row_codes;
+    scale_row[i] = reinterpret_cast<const __half*>(base + a.n_experts * exp_rows * row_codes) + row * NB;
+  }
+  v8f acc[2][4];
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[i][j] = v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const int hidden = NB * 128;
+#pragma unroll 1
+  for (int b = 0; b < NB; ++b) {
+    if (b > 0) __syncthreads();
+    {  // stage 64 tokens x 128 rotated inputs (f16): 32 halves per thread
+      const int t = tid >> 2, c0 = (tid & 3) * 32;
+      u32x4 v[4] = {u32x4{0, 0, 0, 0}, u32x4{0, 0, 0, 0}, u32x4{0, 0, 0, 0}, u32x4{0, 0, 0, 0}};
+      if (t < n_tok) {
+        const std::size_t src =
+            static_cast<std::size_t>(a.group_slots[first + t] / a.used) * hidden + b * 128 + c0;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) v[q] = *reinterpret_cast<const u32x4*>(a.group_xr_hi + src + 8 * q);
+      }
+      __builtin_memcpy(&s.b[t][c0], v, 64);
+    }
+    __syncthreads();
+    PrefillBlock(s, codes_row, scale_row, b, NB, acc);
+  }
+  // Store: element k of lane l is row tile row 2k + l/16, token l%16.
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int r256 = (2 * wave + i) * 16 + (lane >> 4);
+    float* part = r256 < 128 ? a.gate_part : a.up_part;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int t = j * 16 + (lane & 15);
+      if (t >= n_tok) continue;
+      float* p = part + static_cast<std::size_t>(a.group_slots[first + t]) * a.ff + tile * 128 + (r256 & 127);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) p[2 * k] = acc[i][j][k];
+    }
+  }
+  __threadfence();
+  __syncthreads();
+  // Finisher for the 128-row tile of each token (8 tokens per wave).
+#pragma unroll 1
+  for (int t = wave; t < n_tok; t += kThreads / kWave) {
+    const int ms = a.group_slots[first + t];
+    float* gp = a.gate_part + static_cast<std::size_t>(ms) * a.ff + tile * 128;
+    const float* up = a.up_part + static_cast<std::size_t>(ms) * a.ff + tile * 128;
+    float g[4], u[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      g[j] = LoadPartial(gp + lane + 32 * j);
+      u[j] = LoadPartial(up + lane + 32 * j);
+    }
+    Fwht128Wave(g);
+    Fwht128Wave(u);
+    float h[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int i = tile * 128 + lane + 32 * j;
+      h[j] = Silu(g[j] * a.sv_gate[i]) * (u[j] * a.sv_up[i]) * a.su_down[i];
+    }
+    Fwht128Wave(h);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) gp[lane + 32 * j] = h[j];
+  }
+}
+
+// Down, prefill v2. grid.x = (hidden / 256) * max_items. Writes each slot's
+// output; CombineKernel follows.
+template <int NB>
+__global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
+  __shared__ __attribute__((aligned(16))) PrefillLds s;
+  const int tiles = a.hidden / kTileRows;
+  const int item = blockIdx.x / tiles;
+  const int tile = blockIdx.x % tiles;
+  if (item >= *a.group_n_items) return;
+  const int2 it = static_cast<const int2*>(a.group_items)[item];
+  const int e = it.x, first = it.y;
+  const int end = min(first + kTileTokens, a.group_offsets[e + 1]);
+  const int n_tok = end - first;
+  const int tid = threadIdx.x, wave = tid / kWave, lane = tid & (kWave - 1);
+  constexpr int kIn = NB * 128;
+  const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
+  const std::size_t exp_rows = static_cast<std::size_t>(a.hidden);
+  const std::uint8_t* codes_row[2];
+  const __half* scale_row[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const std::size_t row = static_cast<std::size_t>(e) * exp_rows + tile * kTileRows +
+                            (2 * wave + i) * 16 + (lane & 15);
+    codes_row[i] = a.down + row * row_codes;
+    scale_row[i] = reinterpret_cast<const __half*>(a.down + a.n_experts * exp_rows * row_codes) + row * NB;
+  }
+  v8f acc[2][4];
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[i][j] = v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll 1
+  for (int b = 0; b < NB; ++b) {
+    if (b > 0) __syncthreads();
+    {  // stage 64 tokens x 128 down inputs (f32 -> f16): 32 values per thread
+      const int t = tid >> 2, c0 = (tid & 3) * 32;
+      _Float16 hv[32];
+      if (t < n_tok) {
+        const float4* src = reinterpret_cast<const float4*>(
+            a.down_in + static_cast<std::size_t>(a.group_slots[first + t]) * kIn + b * 128 + c0);
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+          const float4 f = src[q];
+          hv[4 * q] = static_cast<_Float16>(f.x);
+          hv[4 * q + 1] = static_cast<_Float16>(f.y);
+          hv[4 * q + 2] = static_cast<_Float16>(f.z);
+          hv[4 * q + 3] = static_cast<_Float16>(f.w);
+        }
+      } else {
+#pragma unroll
+        for (int q = 0; q < 32; ++q) hv[q] = static_cast<_Float16>(0.0f);
+      }
+      __builtin_memcpy(&s.b[t][c0], hv, 64);
+    }
+    __syncthreads();
+    PrefillBlock(s, codes_row, scale_row, b, NB, acc);
+  }
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int r = tile * kTileRows + (2 * wave + i) * 16 + (lane >> 4);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int t = j * 16 + (lane & 15);
+      if (t >= n_tok) continue;
+      float* p = a.down_part + static_cast<std::size_t>(a.group_slots[first + t]) * a.hidden + r;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) p[2 * k] = acc[i][j][k];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Slot grouping for prefill: offsets[e + 1] counts the slots that selected
 // expert e, an exclusive scan turns counts into offsets, and a scatter writes
 // each slot at its expert's cursor. The order within an expert depends on
@@ -1217,25 +1468,31 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
   if (a.ff % 128 != 0 || a.hidden % 128 != 0 || n_slots <= 0 || a.used <= 0 ||
       n_slots != a.n_tokens * a.used)
     return false;
-  unsigned wgs = static_cast<unsigned>(n_slots) * (2u * a.ff / 64u);
+  unsigned shared_wgs = 0;  // the shared-expert down range after the routed workgroups
   if (a.shared_down != nullptr) {
     if (a.shared_ff % 128 != 0 || a.shared_ff <= 0)
       return false;
-    wgs += static_cast<unsigned>(a.n_tokens) * (a.hidden / 128u) * (a.shared_ff / 128u);
+    shared_wgs = static_cast<unsigned>(a.n_tokens) * (a.hidden / 128u) * (a.shared_ff / 128u);
   }
+  unsigned wgs = static_cast<unsigned>(n_slots) * (2u * a.ff / 64u) + shared_wgs;
   const bool group = a.group_offsets != nullptr;
   const bool wmma =
       group && gufo::quant::fused::GroupWmma(n_slots, static_cast<int>(a.n_experts));
   if (wmma && (a.group_xr_hi == nullptr || (!a.plain_f16 && a.group_xr_lo == nullptr)))
     return false;
-  if (group) wgs = static_cast<unsigned>(a.n_experts) * (2u * a.ff / 64u) +
-                   (wgs - static_cast<unsigned>(n_slots) * (2u * a.ff / 64u));
+  // Prefill v2 (tile work list, single-pass f16) when the work list is given.
+  const bool v2 = wmma && a.group_items != nullptr;
+  const dim3 v2_grid(static_cast<unsigned>(a.ff / 128) * static_cast<unsigned>(a.group_max_items) +
+                     shared_wgs);
+  if (group) wgs = static_cast<unsigned>(a.n_experts) * (2u * a.ff / 64u) + shared_wgs;
   const dim3 grid(wgs);
   const bool share = !group && gufo::quant::fused::ShareExperts(a.n_tokens, n_slots);
   switch (a.hidden / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
-    if (group && wmma && a.plain_f16)                                        \
+    if (v2)                                                                  \
+      gufo::quant::fused::GateUpPrefillKernel<nb><<<v2_grid, kThreads, 0, stream>>>(a); \
+    else if (group && wmma && a.plain_f16)                                   \
       gufo::quant::fused::GateUpWmmaKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else if (group && wmma)                                                  \
       gufo::quant::fused::GateUpWmmaKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
@@ -1275,10 +1532,14 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
   const dim3 grid(group ? static_cast<unsigned>(a.n_experts) * (a.hidden / 128u) * 2u
                         : static_cast<unsigned>(n_tokens) * (a.hidden / 128u) * a.used * 2u);
   const bool share = !group && gufo::quant::fused::ShareExperts(n_tokens, n_tokens * a.used);
+  const bool v2 = wmma && a.group_items != nullptr;
+  const dim3 v2_grid(static_cast<unsigned>(a.hidden / 256) * static_cast<unsigned>(a.group_max_items));
   switch (a.ff / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
-    if (group && wmma && a.plain_f16)                                        \
+    if (v2)                                                                  \
+      gufo::quant::fused::DownPrefillKernel<nb><<<v2_grid, kThreads, 0, stream>>>(a); \
+    else if (group && wmma && a.plain_f16)                                   \
       gufo::quant::fused::DownWmmaKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else if (group && wmma)                                                  \
       gufo::quant::fused::DownWmmaKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
@@ -1320,6 +1581,17 @@ bool i4r_rotate_expert_input(const float* x, const float* su, std::uint16_t* hi,
                                                 stream>>>(
       x, su, reinterpret_cast<_Float16*>(hi), reinterpret_cast<_Float16*>(lo), hidden / 128, total);
   return hipGetLastError() == hipSuccess;
+}
+
+bool i4r_prefill_tiles(const std::int32_t* offsets, int n_experts, void* items,
+                       std::int32_t* n_items, hipStream_t stream) {
+  gufo::quant::fused::BuildTilesKernel<<<1, 32, 0, stream>>>(offsets, n_experts,
+                                                             static_cast<int2*>(items), n_items);
+  return hipGetLastError() == hipSuccess;
+}
+
+int i4r_prefill_max_tiles(int n_slots, int n_experts) {
+  return n_experts + (n_slots + gufo::quant::fused::kTileTokens - 1) / gufo::quant::fused::kTileTokens;
 }
 
 bool i4r_group_slots(const std::int32_t* ids, int n_slots, int n_experts,

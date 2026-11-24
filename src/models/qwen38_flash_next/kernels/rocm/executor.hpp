@@ -1092,6 +1092,9 @@ private:
   /// [max_batch x hidden] each.
   std::uint16_t* rot_group_xr_hi_{nullptr};
   std::uint16_t* rot_group_xr_lo_{nullptr};
+  /// Prefill v2 tile work list (i4r_prefill_tiles): int2 items and count.
+  void* rot_group_items_{nullptr};
+  std::int32_t* rot_group_n_items_{nullptr};
   /// ht kernel scratch: cross-workgroup partial sums and per-band arrival
   /// counters (zeroed; each finishing workgroup resets its counter).
   float* ht_partials_{nullptr};

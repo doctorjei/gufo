@@ -82,6 +82,14 @@ if (ENGINE_ENABLE_HIP)
     qwen38_flash_next_test_hip
     gufo_qwen38_flash_next_reference
     gufo_core)
+  # Prefill dense GEMM: the engine's f16 kernel against hipBLASLt at the v2
+  # prefill shapes. Manual only; needs a GPU.
+  add_executable(prefill_gemm_bench EXCLUDE_FROM_ALL prefill_gemm_bench.hip)
+  set_target_properties(prefill_gemm_bench PROPERTIES
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON)
+  target_link_libraries(prefill_gemm_bench PRIVATE qwen38_flash_next_test_hip gufo_core
+    roc::hipblaslt hip::host)
   # Batched i4r MoE decode: microbenchmark plus real-geometry cross-check
   # against the unbatched dispatch. Manual only; needs a GPU.
   add_executable(i4r_fused_bench EXCLUDE_FROM_ALL i4r_fused_bench.hip)

@@ -284,6 +284,8 @@ struct Group {
   unsigned* counters = nullptr;
   std::uint16_t* xr_hi = nullptr;
   std::uint16_t* xr_lo = nullptr;
+  void* items = nullptr;  // prefill v2 tile list
+  std::int32_t* n_items = nullptr;
   const float* su = nullptr;
 };
 
@@ -293,7 +295,9 @@ void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const flo
   if (grp != nullptr &&
       (!i4r_group_slots(ids, n_tokens * kUsed, static_cast<int>(n_experts), grp->offsets,
                         grp->cursor, grp->slots, st) ||
-       !i4r_rotate_expert_input(x, L.su_experts, grp->xr_hi, grp->xr_lo, n_tokens, kHidden, st)))
+       !i4r_rotate_expert_input(x, L.su_experts, grp->xr_hi, grp->xr_lo, n_tokens, kHidden, st) ||
+       (grp->items != nullptr &&
+        !i4r_prefill_tiles(grp->offsets, static_cast<int>(n_experts), grp->items, grp->n_items, st))))
     std::exit(3);
   I4rGateUpArgs gu{};
   gu.gate = L.gate_new;
@@ -318,6 +322,9 @@ void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const flo
     gu.group_counters = grp->counters;
     gu.group_xr_hi = grp->xr_hi;
     gu.group_xr_lo = grp->xr_lo;
+    gu.group_items = grp->items;
+    gu.group_n_items = grp->n_items;
+    gu.group_max_items = i4r_prefill_max_tiles(n_tokens * kUsed, static_cast<int>(n_experts));
   }
   if (!i4r_fused_gate_up(&gu, n_tokens * kUsed, st)) std::exit(3);
   I4rDownArgs dn{};
@@ -336,6 +343,9 @@ void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const flo
   if (grp != nullptr) {
     dn.group_offsets = grp->offsets;
     dn.group_slots = grp->slots;
+    dn.group_items = grp->items;
+    dn.group_n_items = grp->n_items;
+    dn.group_max_items = i4r_prefill_max_tiles(n_tokens * kUsed, static_cast<int>(n_experts));
   }
   if (!i4r_fused_down(&dn, n_tokens, st)) std::exit(3);
 }
@@ -652,6 +662,8 @@ int main(int argc, char** argv) {
     HIP_OK(hipMemset(g.counters, 0, n_exp * (kFf / 128) * sizeof(unsigned)));
     HIP_OK(hipMalloc(&g.xr_hi, kP * kHidden * sizeof(std::uint16_t)));
     HIP_OK(hipMalloc(&g.xr_lo, kP * kHidden * sizeof(std::uint16_t)));
+    HIP_OK(hipMalloc(&g.items, i4r_prefill_max_tiles(kP * kUsed, static_cast<int>(n_exp)) * 8));
+    HIP_OK(hipMalloc(&g.n_items, sizeof(std::int32_t)));
     float* ref = falloc(kP * kHidden);
     std::vector<std::int32_t> ids(kP * kUsed), perm(n_exp);
     for (std::size_t i = 0; i < n_exp; ++i) perm[i] = static_cast<std::int32_t>(i);
@@ -674,9 +686,9 @@ int main(int argc, char** argv) {
       RunBatch(layers[0], b, dids + t * kUsed, b.x + t * kHidden, b.weights + t * kUsed,
                ref + t * kHidden, 1, n_exp, st);
     const auto r = Download(ref, kP * kHidden);
-    // The grouped launches run on the matrix cores: same weights and input
-    // precision, another summation order, so compare with a tolerance (the
-    // split-input gate of the cross-check, 1e-4 of each token's peak).
+    // At 256 tokens the dot-product grouped kernels run (bit-identical); at
+    // 1,024 the prefill v2 matrix-core kernels (single-pass f16 weights and
+    // inputs, about 5e-4 of peak by design), so the gate is 2e-3.
     double worst = 0.0;
     for (int rep = 0; rep < 2; ++rep) {  // twice: counters must reset themselves
       RunBatch(layers[0], b, dids, b.x, b.weights, b.out, kP, n_exp, st, &g);
@@ -686,8 +698,8 @@ int main(int argc, char** argv) {
     }
     std::printf("prefill chunk of %d tokens, grouped by expert: worst peak-normalised error vs per-token runs %.3e\n",
                 kP, worst);
-    if (!(worst < 1e-4)) {
-      std::printf("FAIL: grouped prefill exceeds 1e-4 against per-token runs\n");
+    if (!(worst < 2e-3)) {
+      std::printf("FAIL: grouped prefill exceeds 2e-3 against per-token runs\n");
       ++fails;
     }
     auto time_p = [&](const Group* grp) {

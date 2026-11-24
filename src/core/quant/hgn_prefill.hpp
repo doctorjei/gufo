@@ -30,6 +30,12 @@ extern "C" {
 bool ht_decode_f16(const std::uint8_t* codes, int rows, int cols, void* out,
                    hipStream_t stream);
 
+/// The full weights W = diag(sv) . Hn . M . Hn . diag(su) / 128 of a kHT4
+/// matrix as row-major f16 (the rotations folded in, so a GEMM can use plain
+/// f16 activations). One workgroup per 128 x 128 block, 64 KiB LDS.
+bool ht_decode_rotated_f16(const std::uint8_t* codes, const float* su, const float* sv, int rows,
+                           int cols, void* out, hipStream_t stream);
+
 /// x' = Hn(su * x) / sqrt(128) per 128-value block, rounded to f16:
 /// x is [n_tokens][cols] f32, out [n_tokens][cols] f16.
 bool ht_rotate_input_f16(const float* x, const float* su, void* out,

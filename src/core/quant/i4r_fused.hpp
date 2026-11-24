@@ -60,6 +60,12 @@ struct I4rGateUpArgs {
   /// hi and lo halves (i4r_rotate_expert_input), [n_tokens x hidden] each.
   const std::uint16_t* group_xr_hi;
   const std::uint16_t* group_xr_lo;
+  /// Prefill v2 (single-pass f16, 64-token tiles): the tile work list from
+  /// i4r_prefill_tiles (int2 {expert, first slot}), its device count, and the
+  /// host-side upper bound used to size the grid. Null items: not used.
+  const void* group_items;
+  const std::int32_t* group_n_items;
+  int group_max_items;
 };
 
 struct I4rDownArgs {
@@ -84,6 +90,9 @@ struct I4rDownArgs {
   int plain_f16;  ///< as in I4rGateUpArgs
   const std::int32_t* group_offsets;  ///< as in I4rGateUpArgs (same grouping)
   const std::int32_t* group_slots;
+  const void* group_items;            ///< as in I4rGateUpArgs
+  const std::int32_t* group_n_items;
+  int group_max_items;
 };
 
 /// Launches gate+up for n_slots = n_tokens * used slots. False when the
@@ -93,6 +102,13 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots,
 
 /// Launches down + combine for n_tokens tokens.
 bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream);
+
+/// Lists every 64-token tile of every expert after i4r_group_slots: items
+/// [max] int2 {expert, first slot index}, *n_items the count.
+bool i4r_prefill_tiles(const std::int32_t* offsets, int n_experts, void* items,
+                       std::int32_t* n_items, hipStream_t stream);
+/// Upper bound on the tile count (grid sizing, no host read-back).
+int i4r_prefill_max_tiles(int n_slots, int n_experts);
 
 /// x' = Hn(su * x) per 128-value block as f16 hi + lo halves (the grouped
 /// gate+up input), [n_tokens x hidden] each.
