@@ -42,7 +42,8 @@
 //     once and run through all its slots. Once experts average 16 slots
 //     the grouped launches run on the matrix cores (GateUpWmmaKernel,
 //     DownWmmaKernel): same weights and input precision, a different
-//     summation order.
+//     summation order. Grouped down launches only write each slot's
+//     output; a separate CombineKernel pass does the weighted combine.
 //
 // Rotation contract (unchanged from i4r_kernels.hip.cpp / the RFC):
 //   xr   = Hn(su_experts * x)                  (fused into gate+up's staging)
@@ -592,7 +593,7 @@ __global__ __launch_bounds__(kThreads) void GateUpGroupKernel(GateUpArgs a) {
 // the token's slots, the output rotation once on the sum, the gated shared
 // expert.
 __device__ __forceinline__ void Combine(const DownArgs& a, int token, int tile) {
-  const int lane = threadIdx.x;
+  const int lane = threadIdx.x & (kWave - 1);
   float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   for (int e = 0; e < a.used; ++e) {
     const int sl = token * a.used + e;
@@ -745,7 +746,7 @@ __global__ __launch_bounds__(kThreads) void DownKernel(DownArgs a) {
 // arrival per member token's output tile; the last to arrive at a token's
 // tile combines it. Shared by the verify (share) and prefill (grouped)
 // kernels.
-template <int NB, bool kSplitInput>
+template <int NB, bool kSplitInput, bool kArrive = true>
 __device__ __forceinline__ void DownMembers(const DownArgs& a, int expert, int tile, int half,
                                             const int* members, int n_mem, _Float16* xh,
                                             _Float16* xl) {
@@ -794,6 +795,7 @@ __device__ __forceinline__ void DownMembers(const DownArgs& a, int expert, int t
     if (q == 0) part[row] = acc;
   }
 
+  if constexpr (!kArrive) return;  // grouped launches combine in a separate pass
   // One arrival per member token's tile (each slot still gets exactly two,
   // one per half); the last to arrive at a token's tile combines it.
 #pragma unroll 1
@@ -840,7 +842,7 @@ __global__ __launch_bounds__(kThreads) void DownGroupKernel(DownArgs a) {
   const int off = a.group_offsets[e];
   const int n_mem = a.group_offsets[e + 1] - off;
   if (n_mem == 0) return;
-  DownMembers<NB, kSplitInput>(a, e, r >> 1, r & 1, a.group_slots + off, n_mem, xh, xl);
+  DownMembers<NB, kSplitInput, false>(a, e, r >> 1, r & 1, a.group_slots + off, n_mem, xh, xl);
 }
 
 
@@ -1121,15 +1123,19 @@ __global__ __launch_bounds__(kThreads) void DownWmmaKernel(DownArgs a) {
     }
   }
 
-  // One arrival per slot's token tile (two per slot, one per half); the last
-  // to arrive at a token's tile combines it.
-  const int per_tile = a.used * 2;
-#pragma unroll 1
-  for (int m = 0; m < n_mem; ++m) {
-    const int mt = members[m] / a.used;
-    const bool last = LastArrival(a.counters + mt * tiles + tile, static_cast<unsigned>(per_tile));
-    if (last && tid < kWave) Combine(a, mt, tile);
-  }
+  // The combine runs as its own pass (CombineKernel): grouped launches
+  // serve many tokens per workgroup, and one arrival per token cost a
+  // barrier and an atomic each.
+}
+
+// Combine for the grouped launches, after all slots' down outputs are
+// written: one wave per (token, 128-row output tile), 8 a workgroup. The same
+// arithmetic and order as the last-arriver combine.
+__global__ __launch_bounds__(256) void CombineKernel(DownArgs a, int total) {
+  const int w = blockIdx.x * 8 + static_cast<int>(threadIdx.x) / kWave;
+  if (w >= total) return;
+  const int tiles = a.hidden / 128;
+  Combine(a, w / tiles, w % tiles);
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,7 +1294,11 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
       gufo::quant::fused::DownKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else                                                                     \
       gufo::quant::fused::DownKernel<nb, true><<<grid, kThreads, 0, stream>>>(a); \
-    return true;
+    if (group) {                                                             \
+      const int total = n_tokens * static_cast<int>(a.hidden / 128);         \
+      gufo::quant::fused::CombineKernel<<<(total + 7) / 8, 256, 0, stream>>>(a, total); \
+    }                                                                        \
+    return hipGetLastError() == hipSuccess;
     GUFO_I4R_CASE(1)
     GUFO_I4R_CASE(2)
     GUFO_I4R_CASE(4)
