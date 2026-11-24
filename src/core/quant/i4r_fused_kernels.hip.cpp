@@ -1162,7 +1162,7 @@ constexpr int kTileRows = 256;
 constexpr int kBStride = 136;  // halves per staged token row (128 + 8)
 
 struct PrefillLds {
-  _Float16 b[kTileTokens][kBStride];
+  _Float16 b[2][kTileTokens][kBStride];  // double-buffered input blocks
 };
 
 // Sixteen f16 weights (one K16 step of one row) from 16 code bytes: the low
@@ -1182,14 +1182,11 @@ __device__ __forceinline__ v16h DecodeK16(u32x4 c, bool high, half2_t scale2) {
   return f;
 }
 
-// One 128-value block: this wave's two row tiles against the four staged
-// token tiles. codes_row[i] points at row tile i's row for this lane.
-__device__ __forceinline__ void PrefillBlock(const PrefillLds& s, const std::uint8_t* const codes_row[2],
-                                             const __half* const scale_row[2], int b, int NB,
-                                             v8f acc[2][4]) {
-  const int lane = threadIdx.x & (kWave - 1);
-  u32x4 c[2][4];
-  half2_t sc[2];
+// This lane's codes and block scales of block b for the wave's two row
+// tiles (codes_row[i]: row tile i's row for this lane).
+__device__ __forceinline__ void LoadBlockCodes(const std::uint8_t* const codes_row[2],
+                                               const __half* const scale_row[2], int b,
+                                               u32x4 (&c)[2][4], half2_t (&sc)[2]) {
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
 #pragma unroll
@@ -1198,12 +1195,18 @@ __device__ __forceinline__ void PrefillBlock(const PrefillLds& s, const std::uin
     const _Float16 s1 = __builtin_bit_cast(_Float16, scale_row[i][b]);
     sc[i] = half2_t{s1, s1};
   }
-  (void)NB;
+}
+
+// One 128-value block from staged input buffer `buf`: this wave's two row
+// tiles against the four token tiles.
+__device__ __forceinline__ void PrefillBlock(const PrefillLds& s, int buf, const u32x4 (&c)[2][4],
+                                             const half2_t (&sc)[2], v8f acc[2][4]) {
+  const int lane = threadIdx.x & (kWave - 1);
 #pragma unroll
   for (int kk = 0; kk < 8; ++kk) {
     v16h fb[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) __builtin_memcpy(&fb[j], &s.b[j * 16 + (lane & 15)][kk * 16], 32);
+    for (int j = 0; j < 4; ++j) __builtin_memcpy(&fb[j], &s.b[buf][j * 16 + (lane & 15)][kk * 16], 32);
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const v16h fa = DecodeK16(c[i][kk & 3], kk >= 4, sc[i]);
@@ -1229,7 +1232,7 @@ __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
   const int tiles = a.ff / 128;
   const int routed_wgs = tiles * a.group_max_items;
   if (static_cast<int>(blockIdx.x) >= routed_wgs) {  // the shared-expert down range
-    SharedDownRange<true>(a, blockIdx.x - routed_wgs, &s.b[0][0], &s.b[1][0]);
+    SharedDownRange<true>(a, blockIdx.x - routed_wgs, &s.b[0][0][0], &s.b[0][1][0]);
     return;
   }
   const int item = blockIdx.x / tiles;
@@ -1259,22 +1262,46 @@ __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) acc[i][j] = v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   const int hidden = NB * 128;
+  // Pipelined over the 128-value blocks: block b + 1's codes and inputs are
+  // fetched into registers while block b multiplies, then the inputs go to
+  // the other LDS buffer; one barrier per block.
+  const int st = tid >> 2, sc0 = (tid & 3) * 32;
+  const std::size_t x_row =
+      st < n_tok ? static_cast<std::size_t>(a.group_slots[first + st] / a.used) * hidden : 0;
+  const auto fetch_x = [&](int b, u32x4 (&v)[4]) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) v[q] = u32x4{0, 0, 0, 0};
+    if (st < n_tok) {
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+        v[q] = *reinterpret_cast<const u32x4*>(a.group_xr_hi + x_row + b * 128 + sc0 + 8 * q);
+    }
+  };
+  u32x4 c[2][4], cn[2][4];
+  half2_t sc[2], scn[2];
+  u32x4 xv[4];
+  LoadBlockCodes(codes_row, scale_row, 0, c, sc);
+  fetch_x(0, xv);
+  __builtin_memcpy(&s.b[0][st][sc0], xv, 64);
+  __syncthreads();
 #pragma unroll 1
   for (int b = 0; b < NB; ++b) {
-    if (b > 0) __syncthreads();
-    {  // stage 64 tokens x 128 rotated inputs (f16): 32 halves per thread
-      const int t = tid >> 2, c0 = (tid & 3) * 32;
-      u32x4 v[4] = {u32x4{0, 0, 0, 0}, u32x4{0, 0, 0, 0}, u32x4{0, 0, 0, 0}, u32x4{0, 0, 0, 0}};
-      if (t < n_tok) {
-        const std::size_t src =
-            static_cast<std::size_t>(a.group_slots[first + t] / a.used) * hidden + b * 128 + c0;
+    const bool more = b + 1 < NB;
+    if (more) {
+      LoadBlockCodes(codes_row, scale_row, b + 1, cn, scn);
+      fetch_x(b + 1, xv);
+    }
+    PrefillBlock(s, b & 1, c, sc, acc);
+    if (more) {
+      __builtin_memcpy(&s.b[(b + 1) & 1][st][sc0], xv, 64);
 #pragma unroll
-        for (int q = 0; q < 4; ++q) v[q] = *reinterpret_cast<const u32x4*>(a.group_xr_hi + src + 8 * q);
+      for (int i = 0; i < 2; ++i) {
+        sc[i] = scn[i];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) c[i][q] = cn[i][q];
       }
-      __builtin_memcpy(&s.b[t][c0], v, 64);
     }
     __syncthreads();
-    PrefillBlock(s, codes_row, scale_row, b, NB, acc);
   }
   // Store: element k of lane l is row tile row 2k + l/16, token l%16.
 #pragma unroll
@@ -1349,31 +1376,56 @@ __global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
   for (int i = 0; i < 2; ++i)
 #pragma unroll
     for (int j = 0; j < 4; ++j) acc[i][j] = v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  // Pipelined as in GateUpPrefillKernel; the f32 down inputs are rounded to
+  // f16 on their way into LDS.
+  const int st = tid >> 2, sc0 = (tid & 3) * 32;
+  const float* din_row =
+      st < n_tok ? a.down_in + static_cast<std::size_t>(a.group_slots[first + st]) * kIn : nullptr;
+  const auto fetch_x = [&](int b, float4 (&v)[8]) {
+#pragma unroll
+    for (int q = 0; q < 8; ++q) v[q] = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (din_row != nullptr) {
+      const float4* src = reinterpret_cast<const float4*>(din_row + b * 128 + sc0);
+#pragma unroll
+      for (int q = 0; q < 8; ++q) v[q] = src[q];
+    }
+  };
+  const auto store_x = [&](int buf, const float4 (&v)[8]) {
+    _Float16 hv[32];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+      hv[4 * q] = static_cast<_Float16>(v[q].x);
+      hv[4 * q + 1] = static_cast<_Float16>(v[q].y);
+      hv[4 * q + 2] = static_cast<_Float16>(v[q].z);
+      hv[4 * q + 3] = static_cast<_Float16>(v[q].w);
+    }
+    __builtin_memcpy(&s.b[buf][st][sc0], hv, 64);
+  };
+  u32x4 c[2][4], cn[2][4];
+  half2_t sc[2], scn[2];
+  float4 xv[8];
+  LoadBlockCodes(codes_row, scale_row, 0, c, sc);
+  fetch_x(0, xv);
+  store_x(0, xv);
+  __syncthreads();
 #pragma unroll 1
   for (int b = 0; b < NB; ++b) {
-    if (b > 0) __syncthreads();
-    {  // stage 64 tokens x 128 down inputs (f32 -> f16): 32 values per thread
-      const int t = tid >> 2, c0 = (tid & 3) * 32;
-      _Float16 hv[32];
-      if (t < n_tok) {
-        const float4* src = reinterpret_cast<const float4*>(
-            a.down_in + static_cast<std::size_t>(a.group_slots[first + t]) * kIn + b * 128 + c0);
+    const bool more = b + 1 < NB;
+    if (more) {
+      LoadBlockCodes(codes_row, scale_row, b + 1, cn, scn);
+      fetch_x(b + 1, xv);
+    }
+    PrefillBlock(s, b & 1, c, sc, acc);
+    if (more) {
+      store_x((b + 1) & 1, xv);
 #pragma unroll
-        for (int q = 0; q < 8; ++q) {
-          const float4 f = src[q];
-          hv[4 * q] = static_cast<_Float16>(f.x);
-          hv[4 * q + 1] = static_cast<_Float16>(f.y);
-          hv[4 * q + 2] = static_cast<_Float16>(f.z);
-          hv[4 * q + 3] = static_cast<_Float16>(f.w);
-        }
-      } else {
+      for (int i = 0; i < 2; ++i) {
+        sc[i] = scn[i];
 #pragma unroll
-        for (int q = 0; q < 32; ++q) hv[q] = static_cast<_Float16>(0.0f);
+        for (int q = 0; q < 4; ++q) c[i][q] = cn[i][q];
       }
-      __builtin_memcpy(&s.b[t][c0], hv, 64);
     }
     __syncthreads();
-    PrefillBlock(s, codes_row, scale_row, b, NB, acc);
   }
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
