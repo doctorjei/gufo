@@ -267,9 +267,10 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
 
 /// F16 activation rows [batch][k], Q8_0 weights dequantized to F16 in LDS,
 /// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
+/// input_stride (halves, zero means k): padded input rows, batch >= 1024 only.
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
-                        hipStream_t stream);
+                        hipStream_t stream, std::size_t input_stride = 0);
 /// input_stride is in half elements; zero means k. Padded rows are supported
 /// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,

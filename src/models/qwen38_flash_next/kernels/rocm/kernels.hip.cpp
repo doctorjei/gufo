@@ -8382,8 +8382,11 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
 
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
-                        hipStream_t stream) {
+                        hipStream_t stream, std::size_t input_stride) {
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
+    return false;
+  const bool strided = input_stride != 0 && input_stride != k;
+  if (strided && (batch < 1024 || input_stride < k || input_stride % 8 != 0))
     return false;
   // Wide batches reuse each staged fragment across twice the rows and
   // tokens (router 0.61 to 0.52 ms, GDN alpha/beta 0.14 to 0.09 ms at 4,096
@@ -8394,6 +8397,16 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
     // 0.68 ms at 2,304 tokens), 512 for narrow deep shapes (hc down
     // 320 x 10,240: 0.95 -> 0.88 ms), else the default 4,096.
     const std::uint32_t raster = k <= 640 ? 256u : (m <= 512 && k >= 8192 ? 512u : 0u);
+    if (strided) {
+      // Padded rows (the linear-attention output written in f16 by its own
+      // epilogue): the same tiles and K order, only the row addressing.
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<128, 128, 2, 2, 4, 1, false, false, false, true, false, true>),
+          dim3((batch + 127) / 128, (m + 127) / 128), dim3(kThreads), 0, stream,
+          w, x, out, batch, m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
+          AttentionProjectionOutput{}, PassCheckpoints{}, input_stride, 0u, raster);
+      return true;
+    }
     hipLaunchKernelGGL(
         (DenseF16GEMMKernel<128, 128, 2, 2, 4, 1, false, false, false, true>),
         dim3((batch + 127) / 128, (m + 127) / 128), dim3(kThreads), 0, stream,

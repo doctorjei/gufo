@@ -2522,7 +2522,8 @@ bool Executor::WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
 }
 
 bool Executor::WideHgnGemmHalf(const DeviceTensor& w, const __half* x_half, float* out,
-                               std::uint32_t n_tokens, std::string* error_msg) const {
+                               std::uint32_t n_tokens, std::string* error_msg,
+                               std::size_t input_stride) const {
   const int m = static_cast<int>(w.rows);
   const int k = static_cast<int>(w.cols);
   const auto* data = static_cast<const std::uint8_t*>(w.data);
@@ -2533,7 +2534,8 @@ bool Executor::WideHgnGemmHalf(const DeviceTensor& w, const __half* x_half, floa
     AssignError(error_msg, "prefill decode failed");
     return false;
   }
-  if (!UnquantizedF16Gemm(wide_w16_, x_half, out, n_tokens, w.rows, w.cols, stream_)) {
+  if (!UnquantizedF16Gemm(wide_w16_, x_half, out, n_tokens, w.rows, w.cols, stream_,
+                          input_stride)) {
     AssignError(error_msg, "f16 prefill GEMM refused");
     return false;
   }
@@ -3434,8 +3436,16 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   const bool tiled = MatrixRows(n_tokens) &&
                      l.ssm_out.type == GgmlType::kQ8_0 &&
                      n_tokens <= options_.max_batch;
+  // An ht output projection at a wide prefill batch reads the epilogue's
+  // f16 rows too (the same rounding as narrowing the f32 rows, without the
+  // separate pass): it decodes the matrix to f16 for the engine's GEMM.
+  const bool ht_half = MatrixRows(n_tokens) && n_tokens >= 1024 &&
+                       n_tokens <= options_.max_batch && project_output &&
+                       l.ssm_out.type == GgmlType::kHT4 && WidePrefill(n_tokens) &&
+                       WideHgn(l.ssm_out, n_tokens) && l.ssm_out.rows == 2560 &&
+                       l.ssm_out.cols == 6144;
   const bool half_output =
-      tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
+      (tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144) || ht_half;
   auto* out_half =
       half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
   // Shift successive rows off the 12 KiB pitch while retaining every half.
@@ -3465,6 +3475,10 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   z_join.event = nullptr;  // GatedDeltaNet waited for the Z rows
   if (!project_output) {
     return true;
+  }
+  if (ht_half) {
+    half_src_ = nullptr;  // s_.gdn_out now holds f16 rows
+    return WideHgnGemmHalf(l.ssm_out, out_half, out, n_tokens, error_msg, half_stride);
   }
   if (half_output) {
     if (!DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens, l.ssm_out.rows,

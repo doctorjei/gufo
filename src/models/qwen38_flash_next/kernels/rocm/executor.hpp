@@ -675,7 +675,8 @@ private:
                    std::uint32_t n_tokens, std::string* error_msg) const;
   /// WideHgnGemm from rows already in f16 (x_half: [n_tokens][w.cols]).
   bool WideHgnGemmHalf(const DeviceTensor& w, const __half* x_half, float* out,
-                       std::uint32_t n_tokens, std::string* error_msg) const;
+                       std::uint32_t n_tokens, std::string* error_msg,
+                       std::size_t input_stride = 0) const;
   /// y = W x for a kHT4 matrix read in place (ht_dense.hpp), in launches of
   /// up to eight token rows.
   bool HtDense(const DeviceTensor& w, const float* x, float* out,
