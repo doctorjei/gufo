@@ -1211,20 +1211,23 @@ __device__ __forceinline__ void LoadBlockCodes(const std::uint8_t* const codes_r
 template <int RT>
 __device__ __forceinline__ void PrefillBlock(const PrefillLds& s, int buf, const u32x4 (&c)[RT][4],
                                              const half2_t (&sc)[RT], int tbase,
-                                             v8f (&acc)[RT][8 / RT]) {
+                                             v8f (&acc)[RT][8 / RT], int n_groups = 8) {
   constexpr int TT = 8 / RT;
   const int lane = threadIdx.x & (kWave - 1);
 #pragma unroll
   for (int kk = 0; kk < 8; ++kk) {
-    v16h fb[TT];
+    // Token tiles at or past n_groups (uniform: the work item's filled
+    // 16-token tiles) hold no tokens and get no matrix work.
+    v16h fa[RT];
 #pragma unroll
-    for (int j = 0; j < TT; ++j)
-      __builtin_memcpy(&fb[j], &s.b[buf][(tbase + j) * 16 + (lane & 15)][kk * 16], 32);
+    for (int i = 0; i < RT; ++i) fa[i] = DecodeK16(c[i][kk & 3], kk >= 4, sc[i]);
 #pragma unroll
-    for (int i = 0; i < RT; ++i) {
-      const v16h fa = DecodeK16(c[i][kk & 3], kk >= 4, sc[i]);
+    for (int j = 0; j < TT; ++j) {
+      if (tbase + j >= n_groups) break;
+      v16h fb;
+      __builtin_memcpy(&fb, &s.b[buf][(tbase + j) * 16 + (lane & 15)][kk * 16], 32);
 #pragma unroll
-      for (int j = 0; j < TT; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fa, fb[j], acc[i][j]);
+      for (int i = 0; i < RT; ++i) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fa[i], fb, acc[i][j]);
     }
   }
 }
@@ -1266,6 +1269,7 @@ __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
   const int e = it.x, first = it.y;
   const int end = min(first + kTileTokens, a.group_offsets[e + 1]);
   const int n_tok = end - first;
+  const int n_groups = __builtin_amdgcn_readfirstlane((n_tok + 15) / 16);
   const int tid = threadIdx.x, wave = tid / kWave, lane = tid & (kWave - 1);
   const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
   const std::size_t exp_rows = static_cast<std::size_t>(a.ff);
@@ -1324,7 +1328,7 @@ __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
     if constexpr (RT != 2) {
       if (b > 0) LoadBlockCodes<RT>(codes_row, scale_row, b, c, sc);
     }
-    PrefillBlock<RT>(s, b & 1, c, sc, tbase, acc);
+    PrefillBlock<RT>(s, b & 1, c, sc, tbase, acc, n_groups);
     if (more) {
       __builtin_memcpy(&s.b[(b + 1) & 1][st][sc0], xv, 64);
       if constexpr (RT == 2) {
@@ -1393,6 +1397,7 @@ __global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
   const int e = it.x, first = it.y;
   const int end = min(first + kTileTokens, a.group_offsets[e + 1]);
   const int n_tok = end - first;
+  const int n_groups = __builtin_amdgcn_readfirstlane((n_tok + 15) / 16);
   const int tid = threadIdx.x, wave = tid / kWave, lane = tid & (kWave - 1);
   constexpr int kIn = NB * 128;
   const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
@@ -1457,7 +1462,7 @@ __global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
     if constexpr (RT != 2) {
       if (b > 0) LoadBlockCodes<RT>(codes_row, scale_row, b, c, sc);
     }
-    PrefillBlock<RT>(s, b & 1, c, sc, tbase, acc);
+    PrefillBlock<RT>(s, b & 1, c, sc, tbase, acc, n_groups);
     if (more) {
       store_x((b + 1) & 1, xv);
       if constexpr (RT == 2) {
