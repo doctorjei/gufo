@@ -4187,7 +4187,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
     float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
-    std::uint32_t first_query_group = 0) {
+    std::uint32_t first_query_group = 0, __half* __restrict__ out_half = nullptr,
+    std::uint32_t half_stride = 0) {
   // The launcher accepts only four-token selection blocks. Keep that
   // geometry constant throughout the key sweep.
   constexpr std::uint32_t ratio = kWmmaRatio;
@@ -4932,7 +4933,17 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         if (gate != nullptr) {
           value *= SigmoidF(gate[offset]);
         }
-        out[offset] = value;
+        if (out_half != nullptr) {
+          // F16 rows for the output projection, padded to half_stride: the
+          // f32 value as stored otherwise, then rounded (as narrowing it
+          // would), never a fused multiply-and-convert.
+          asm volatile("" : "+v"(value));
+          out_half[(static_cast<std::size_t>(row_query(rb, row)) * half_stride) +
+                   (static_cast<std::size_t>(row_head(rb, row)) * kHeadDim) +
+                   (dim_tile * 16) + sub] = __float2half_rn(value);
+        } else {
+          out[offset] = value;
+        }
       }
     }
   }
@@ -9044,9 +9055,10 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
-                         bool last_only) {
+                         bool last_only, __half* out_half,
+                         std::uint32_t half_stride) {
   if (WmmaCausalAttentionContextLimit(heads, kv_heads, d, ratio) == 0 ||
-      n_tokens == 0) {
+      n_tokens == 0 || (out_half != nullptr && half_stride < heads * d)) {
     return false;
   }
   if (mask != nullptr) {
@@ -9070,7 +9082,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
     hipLaunchKernelGGL(
         (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
         dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-        out, start_pos, n_tokens, first_group);
+        out, start_pos, n_tokens, first_group, out_half, half_stride);
     return true;
   }
   const std::uint32_t first_group =
@@ -9081,7 +9093,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
   hipLaunchKernelGGL(
       (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
       dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-      out, start_pos, n_tokens, first_group);
+      out, start_pos, n_tokens, first_group, out_half, half_stride);
   return true;
 }
 

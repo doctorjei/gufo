@@ -593,6 +593,8 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// and gathers the union of their selections, so a row's rounding depends on
 /// which queries share its tile. A prompt split therefore matches one pass
 /// only when every pass after the first starts on a multiple of four.
+/// With `out_half`, the output rows are written as f16 (rounded from the same
+/// f32 values) at a pitch of `half_stride` halves instead of to `out`.
 /// Session::Feed keeps its own passes there, and the serving runner rounds
 /// pass ends and checkpoints to TextRunnerCapabilities::prefill_alignment
 /// (asserted in TextRunnerPool::Request::Prefill).
@@ -603,7 +605,8 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
+                         bool last_only = false, __half* out_half = nullptr,
+                         std::uint32_t half_stride = 0);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

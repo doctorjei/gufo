@@ -3656,6 +3656,27 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // batch that crosses it, so each position's key sweep (and its rounding)
   // does not depend on where the prefill chunks fall. The sparse part goes
   // first: it is the launch that can be refused.
+  // An ht output projection at a wide prefill batch reads f16 rows written
+  // by the attention epilogue itself, padded off the 12 KiB pitch (as the
+  // linear-attention route): no narrowing pass. They reuse s_.ctx. A wide
+  // kernel that refuses the geometry launches nothing, and the f32 fallback
+  // below projects through Dense as before.
+  const std::uint32_t attn_q_dim = c.AttentionQDim();
+  const bool ht_half = project_output && !last_only && MatrixRows(n_tokens) &&
+                       n_tokens >= 1024 && n_tokens <= options_.max_batch &&
+                       l.attn_out.type == GgmlType::kHT4 && WidePrefill(n_tokens) &&
+                       WideHgn(l.attn_out, n_tokens) && l.attn_out.rows == 2560 &&
+                       l.attn_out.cols == 6144 && attn_q_dim == 6144;
+  const std::uint32_t half_stride = ht_half ? attn_q_dim + 32 : 0;
+  auto* ctx_half = ht_half ? reinterpret_cast<__half*>(s_.ctx) : nullptr;
+  const auto project = [&]() {
+    if (!project_output) return true;
+    if (ht_half) {
+      half_src_ = nullptr;  // s_.ctx now holds f16 rows
+      return WideHgnGemmHalf(l.attn_out, ctx_half, out, n_tokens, error_msg, half_stride);
+    }
+    return Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+  };
   const auto attend = [&](std::uint32_t first, std::uint32_t rows, bool last) {
     const std::uint32_t pos = start_pos + first;
     const std::uint32_t dense_rows = mask != nullptr && pos < c.indexer_top_k
@@ -3663,6 +3684,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                                          : 0;
     const auto at = [&](std::uint32_t row) {
       return std::size_t{first + row} * c.AttentionQDim();
+    };
+    const auto at_half = [&](std::uint32_t row) {
+      return ctx_half != nullptr ? ctx_half + std::size_t{first + row} * half_stride : nullptr;
     };
     return (dense_rows == rows ||
             WmmaCausalAttention(
@@ -3672,12 +3696,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                      : nullptr,
                 mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
                 pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
-                c.compress_ratio, stream_, last)) &&
+                c.compress_ratio, stream_, last, at_half(dense_rows), half_stride)) &&
            (dense_rows == 0 || (last && dense_rows != rows) ||
             WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
                                 s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
                                 dense_rows, pos, c.num_heads, c.num_kv_heads,
-                                c.head_dim, c.compress_ratio, stream_, last));
+                                c.head_dim, c.compress_ratio, stream_, last,
+                                at_half(0), half_stride));
   };
   if (checkpoints.count != 0 && checkpoints.tokens[0] < n_tokens) {
     // Sparse tiles compact the union of their queries' selected keys.
@@ -3694,12 +3719,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       }
       first = std::max(first, end);
     }
-    return !project_output ||
-           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+    return project();
   }
   if (MatrixRows(n_tokens) && attend(0, n_tokens, last_only)) {
-    return !project_output ||
-           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+    return project();
   }
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
