@@ -5071,8 +5071,8 @@ struct RasterTile {
   unsigned group_width;  // token tiles in this group
 };
 template<int BN>
-__device__ __forceinline__ RasterTile GroupedRasterTile() {
-  constexpr unsigned kGroupTiles = kRasterTokens / BN;
+__device__ __forceinline__ RasterTile GroupedRasterTile(unsigned group_tokens = kRasterTokens) {
+  const unsigned kGroupTiles = group_tokens / BN;
   const unsigned per_group = kGroupTiles * gridDim.y;
   const unsigned linear = (blockIdx.y * gridDim.x) + blockIdx.x;
   const unsigned group = linear / per_group;
@@ -7721,7 +7721,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     void* mixed_q8 = nullptr, const float* conv_w = nullptr,
     float* conv_out = nullptr, AttentionProjectionOutput attention = {},
     PassCheckpoints checkpoint_rows = {}, std::size_t input_stride = 0,
-    std::uint32_t first_row_tile = 0) {
+    std::uint32_t first_row_tile = 0, std::uint32_t raster_tokens = 0) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(!(kBf16 && kHalfWeights));
@@ -7770,7 +7770,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   const int wave_tok = wave_id % WN;
   // Group row tiles for the narrow HC up projection. The tile grid's row
   // count is divisible by kRowGroup; every dot product keeps its K order.
-  const RasterTile tile = GroupedRasterTile<BN>();
+  const RasterTile tile = GroupedRasterTile<BN>(raster_tokens != 0 ? raster_tokens : kRasterTokens);
   const unsigned row_group = tile.row_tile / kRowGroup;
   const unsigned within =
       (tile.row_tile % kRowGroup) * tile.group_width + tile.group_tile;
@@ -8389,10 +8389,16 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
   // tokens (router 0.61 to 0.52 ms, GDN alpha/beta 0.14 to 0.09 ms at 4,096
   // tokens). Every output keeps its two K16 chains in K order.
   if (batch >= 1024) {
+    // Tile-order groups (which output tiles run back to back; same values):
+    // 256 tokens for shallow K (hyper-connection up 10,240 x 320: 1.30 ->
+    // 0.68 ms at 2,304 tokens), 512 for narrow deep shapes (hc down
+    // 320 x 10,240: 0.95 -> 0.88 ms), else the default 4,096.
+    const std::uint32_t raster = k <= 640 ? 256u : (m <= 512 && k >= 8192 ? 512u : 0u);
     hipLaunchKernelGGL(
         (DenseF16GEMMKernel<128, 128, 2, 2, 4, 1, false, false, false, true>),
         dim3((batch + 127) / 128, (m + 127) / 128), dim3(kThreads), 0, stream,
-        w, x, out, batch, m, k);
+        w, x, out, batch, m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
+        AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0u, raster);
     return true;
   }
   hipLaunchKernelGGL(
