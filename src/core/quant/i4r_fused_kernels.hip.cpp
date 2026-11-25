@@ -60,6 +60,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "src/core/quant/i4r_fused.hpp"
 
@@ -1174,21 +1175,25 @@ __device__ __forceinline__ v16h DecodeK16(u32x4 c, bool high, half2_t scale2) {
 #pragma unroll
   for (int k = 0; k < 4; ++k) {
     const std::uint32_t t = (high ? (c[k] >> 4) : c[k]) & 0x0F0F0F0Fu;
-    const std::uint32_t p01 = (t & 0xFFu) | ((t & 0xFF00u) << 8);
-    const std::uint32_t p23 = ((t >> 16) & 0xFFu) | ((t >> 8) & 0xFF0000u);
-    h[2 * k] = (AsHalf2(p01 | 0x64006400u) - bias) * scale2;
-    h[2 * k + 1] = (AsHalf2(p23 | 0x64006400u) - bias) * scale2;
+    // One byte permute builds each f16 pair: the nibble bytes b0, b1 (or b2,
+    // b3) of t as the low bytes and 0x64 (from the first operand) as the high
+    // bytes, i.e. (1024 + code) in each half.
+    const std::uint32_t p01 = __builtin_amdgcn_perm(0x64646464u, t, 0x04010400u);
+    const std::uint32_t p23 = __builtin_amdgcn_perm(0x64646464u, t, 0x04030402u);
+    h[2 * k] = (AsHalf2(p01) - bias) * scale2;
+    h[2 * k + 1] = (AsHalf2(p23) - bias) * scale2;
   }
   return f;
 }
 
 // This lane's codes and block scales of block b for the wave's two row
 // tiles (codes_row[i]: row tile i's row for this lane).
-__device__ __forceinline__ void LoadBlockCodes(const std::uint8_t* const codes_row[2],
-                                               const __half* const scale_row[2], int b,
-                                               u32x4 (&c)[2][4], half2_t (&sc)[2]) {
+template <int RT>
+__device__ __forceinline__ void LoadBlockCodes(const std::uint8_t* const codes_row[RT],
+                                               const __half* const scale_row[RT], int b,
+                                               u32x4 (&c)[RT][4], half2_t (&sc)[RT]) {
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < RT; ++i) {
 #pragma unroll
     for (int q = 0; q < 4; ++q)
       c[i][q] = __builtin_nontemporal_load(reinterpret_cast<const u32x4*>(codes_row[i] + b * 64 + q * 16));
@@ -1199,21 +1204,37 @@ __device__ __forceinline__ void LoadBlockCodes(const std::uint8_t* const codes_r
 
 // One 128-value block from staged input buffer `buf`: this wave's two row
 // tiles against the four token tiles.
-__device__ __forceinline__ void PrefillBlock(const PrefillLds& s, int buf, const u32x4 (&c)[2][4],
-                                             const half2_t (&sc)[2], v8f acc[2][4]) {
+// RT row tiles x (8 / RT) token tiles per wave, token tiles from tbase.
+template <int RT>
+__device__ __forceinline__ void PrefillBlock(const PrefillLds& s, int buf, const u32x4 (&c)[RT][4],
+                                             const half2_t (&sc)[RT], int tbase,
+                                             v8f (&acc)[RT][8 / RT]) {
+  constexpr int TT = 8 / RT;
   const int lane = threadIdx.x & (kWave - 1);
 #pragma unroll
   for (int kk = 0; kk < 8; ++kk) {
-    v16h fb[4];
+    v16h fb[TT];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) __builtin_memcpy(&fb[j], &s.b[buf][j * 16 + (lane & 15)][kk * 16], 32);
+    for (int j = 0; j < TT; ++j)
+      __builtin_memcpy(&fb[j], &s.b[buf][(tbase + j) * 16 + (lane & 15)][kk * 16], 32);
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < RT; ++i) {
       const v16h fa = DecodeK16(c[i][kk & 3], kk >= 4, sc[i]);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fa, fb[j], acc[i][j]);
+      for (int j = 0; j < TT; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fa, fb[j], acc[i][j]);
     }
   }
+}
+
+// EXPERIMENTAL: GUFO_PREFILL_RT=4 runs the prefill expert kernels with four
+// row tiles x two token tiles per wave instead of two x four (tile-shape
+// sweep). Read once.
+inline bool PrefillFourRowTiles() {
+  static const bool v = [] {
+    const char* e = std::getenv("GUFO_PREFILL_RT");
+    return e != nullptr && e[0] == '4';
+  }();
+  return v;
 }
 
 __global__ void BuildTilesKernel(const std::int32_t* __restrict__ offsets, int n_experts,
@@ -1226,7 +1247,7 @@ __global__ void BuildTilesKernel(const std::int32_t* __restrict__ offsets, int n
 }
 
 // Gate + up, prefill v2. grid.x = (ff / 128) * max_items.
-template <int NB>
+template <int NB, int RT>
 __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
   __shared__ __attribute__((aligned(16))) PrefillLds s;
   const int tiles = a.ff / 128;
@@ -1245,22 +1266,27 @@ __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
   const int tid = threadIdx.x, wave = tid / kWave, lane = tid & (kWave - 1);
   const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
   const std::size_t exp_rows = static_cast<std::size_t>(a.ff);
-  // Wave w: row tiles 2w, 2w+1 of the 256 rows (0-127 gate, 128-255 up).
-  const std::uint8_t* codes_row[2];
-  const __half* scale_row[2];
+  // Wave layout: RT row tiles x TT token tiles (RT = 2: wave w has row tiles
+  // 2w, 2w+1 and all four token tiles; RT = 4: row tiles 4(w/2).. and token
+  // tiles 2(w%2)..). Rows 0-127 are gate, 128-255 up.
+  constexpr int TT = 8 / RT;
+  const int wr = RT == 2 ? wave : wave >> 1;
+  const int tbase = RT == 2 ? 0 : (wave & 1) * 2;
+  const std::uint8_t* codes_row[RT];
+  const __half* scale_row[RT];
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    const int r256 = (2 * wave + i) * 16 + (lane & 15);
+  for (int i = 0; i < RT; ++i) {
+    const int r256 = (RT * wr + i) * 16 + (lane & 15);
     const std::uint8_t* base = r256 < 128 ? a.gate : a.up;
     const std::size_t row = static_cast<std::size_t>(e) * exp_rows + tile * 128 + (r256 & 127);
     codes_row[i] = base + row * row_codes;
     scale_row[i] = reinterpret_cast<const __half*>(base + a.n_experts * exp_rows * row_codes) + row * NB;
   }
-  v8f acc[2][4];
+  v8f acc[RT][TT];
 #pragma unroll
-  for (int i = 0; i < 2; ++i)
+  for (int i = 0; i < RT; ++i)
 #pragma unroll
-    for (int j = 0; j < 4; ++j) acc[i][j] = v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int j = 0; j < TT; ++j) acc[i][j] = v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   const int hidden = NB * 128;
   // Pipelined over the 128-value blocks: block b + 1's codes and inputs are
   // fetched into registers while block b multiplies, then the inputs go to
@@ -1277,10 +1303,10 @@ __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
         v[q] = *reinterpret_cast<const u32x4*>(a.group_xr_hi + x_row + b * 128 + sc0 + 8 * q);
     }
   };
-  u32x4 c[2][4], cn[2][4];
-  half2_t sc[2], scn[2];
+  u32x4 c[RT][4], cn[RT == 2 ? 2 : 1][4];
+  half2_t sc[RT], scn[RT == 2 ? 2 : 1];
   u32x4 xv[4];
-  LoadBlockCodes(codes_row, scale_row, 0, c, sc);
+  LoadBlockCodes<RT>(codes_row, scale_row, 0, c, sc);
   fetch_x(0, xv);
   __builtin_memcpy(&s.b[0][st][sc0], xv, 64);
   __syncthreads();
@@ -1288,29 +1314,35 @@ __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
   for (int b = 0; b < NB; ++b) {
     const bool more = b + 1 < NB;
     if (more) {
-      LoadBlockCodes(codes_row, scale_row, b + 1, cn, scn);
+      // Codes are prefetched only with two row tiles a wave (registers).
+      if constexpr (RT == 2) LoadBlockCodes<2>(codes_row, scale_row, b + 1, cn, scn);
       fetch_x(b + 1, xv);
     }
-    PrefillBlock(s, b & 1, c, sc, acc);
+    if constexpr (RT != 2) {
+      if (b > 0) LoadBlockCodes<RT>(codes_row, scale_row, b, c, sc);
+    }
+    PrefillBlock<RT>(s, b & 1, c, sc, tbase, acc);
     if (more) {
       __builtin_memcpy(&s.b[(b + 1) & 1][st][sc0], xv, 64);
+      if constexpr (RT == 2) {
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        sc[i] = scn[i];
+        for (int i = 0; i < 2; ++i) {
+          sc[i] = scn[i];
 #pragma unroll
-        for (int q = 0; q < 4; ++q) c[i][q] = cn[i][q];
+          for (int q = 0; q < 4; ++q) c[i][q] = cn[i][q];
+        }
       }
     }
     __syncthreads();
   }
   // Store: element k of lane l is row tile row 2k + l/16, token l%16.
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    const int r256 = (2 * wave + i) * 16 + (lane >> 4);
+  for (int i = 0; i < RT; ++i) {
+    const int r256 = (RT * wr + i) * 16 + (lane >> 4);
     float* part = r256 < 128 ? a.gate_part : a.up_part;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int t = j * 16 + (lane & 15);
+    for (int j = 0; j < TT; ++j) {
+      const int t = (tbase + j) * 16 + (lane & 15);
       if (t >= n_tok) continue;
       float* p = part + static_cast<std::size_t>(a.group_slots[first + t]) * a.ff + tile * 128 + (r256 & 127);
 #pragma unroll
@@ -1347,7 +1379,7 @@ __global__ __launch_bounds__(kThreads) void GateUpPrefillKernel(GateUpArgs a) {
 
 // Down, prefill v2. grid.x = (hidden / 256) * max_items. Writes each slot's
 // output; CombineKernel follows.
-template <int NB>
+template <int NB, int RT>
 __global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
   __shared__ __attribute__((aligned(16))) PrefillLds s;
   const int tiles = a.hidden / kTileRows;
@@ -1362,20 +1394,23 @@ __global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
   constexpr int kIn = NB * 128;
   const std::size_t row_codes = static_cast<std::size_t>(NB) * 64;
   const std::size_t exp_rows = static_cast<std::size_t>(a.hidden);
-  const std::uint8_t* codes_row[2];
-  const __half* scale_row[2];
+  constexpr int TT = 8 / RT;
+  const int wr = RT == 2 ? wave : wave >> 1;
+  const int tbase = RT == 2 ? 0 : (wave & 1) * 2;
+  const std::uint8_t* codes_row[RT];
+  const __half* scale_row[RT];
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < RT; ++i) {
     const std::size_t row = static_cast<std::size_t>(e) * exp_rows + tile * kTileRows +
-                            (2 * wave + i) * 16 + (lane & 15);
+                            (RT * wr + i) * 16 + (lane & 15);
     codes_row[i] = a.down + row * row_codes;
     scale_row[i] = reinterpret_cast<const __half*>(a.down + a.n_experts * exp_rows * row_codes) + row * NB;
   }
-  v8f acc[2][4];
+  v8f acc[RT][TT];
 #pragma unroll
-  for (int i = 0; i < 2; ++i)
+  for (int i = 0; i < RT; ++i)
 #pragma unroll
-    for (int j = 0; j < 4; ++j) acc[i][j] = v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int j = 0; j < TT; ++j) acc[i][j] = v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   // Pipelined as in GateUpPrefillKernel; the f32 down inputs are rounded to
   // f16 on their way into LDS.
   const int st = tid >> 2, sc0 = (tid & 3) * 32;
@@ -1401,10 +1436,10 @@ __global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
     }
     __builtin_memcpy(&s.b[buf][st][sc0], hv, 64);
   };
-  u32x4 c[2][4], cn[2][4];
-  half2_t sc[2], scn[2];
+  u32x4 c[RT][4], cn[RT == 2 ? 2 : 1][4];
+  half2_t sc[RT], scn[RT == 2 ? 2 : 1];
   float4 xv[8];
-  LoadBlockCodes(codes_row, scale_row, 0, c, sc);
+  LoadBlockCodes<RT>(codes_row, scale_row, 0, c, sc);
   fetch_x(0, xv);
   store_x(0, xv);
   __syncthreads();
@@ -1412,27 +1447,33 @@ __global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
   for (int b = 0; b < NB; ++b) {
     const bool more = b + 1 < NB;
     if (more) {
-      LoadBlockCodes(codes_row, scale_row, b + 1, cn, scn);
+      // Codes are prefetched only with two row tiles a wave (registers).
+      if constexpr (RT == 2) LoadBlockCodes<2>(codes_row, scale_row, b + 1, cn, scn);
       fetch_x(b + 1, xv);
     }
-    PrefillBlock(s, b & 1, c, sc, acc);
+    if constexpr (RT != 2) {
+      if (b > 0) LoadBlockCodes<RT>(codes_row, scale_row, b, c, sc);
+    }
+    PrefillBlock<RT>(s, b & 1, c, sc, tbase, acc);
     if (more) {
       store_x((b + 1) & 1, xv);
+      if constexpr (RT == 2) {
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        sc[i] = scn[i];
+        for (int i = 0; i < 2; ++i) {
+          sc[i] = scn[i];
 #pragma unroll
-        for (int q = 0; q < 4; ++q) c[i][q] = cn[i][q];
+          for (int q = 0; q < 4; ++q) c[i][q] = cn[i][q];
+        }
       }
     }
     __syncthreads();
   }
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    const int r = tile * kTileRows + (2 * wave + i) * 16 + (lane >> 4);
+  for (int i = 0; i < RT; ++i) {
+    const int r = tile * kTileRows + (RT * wr + i) * 16 + (lane >> 4);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int t = j * 16 + (lane & 15);
+    for (int j = 0; j < TT; ++j) {
+      const int t = (tbase + j) * 16 + (lane & 15);
       if (t >= n_tok) continue;
       float* p = a.down_part + static_cast<std::size_t>(a.group_slots[first + t]) * a.hidden + r;
 #pragma unroll
@@ -1534,6 +1575,7 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
     return false;
   // Prefill v2 (tile work list, single-pass f16) when the work list is given.
   const bool v2 = wmma && a.group_items != nullptr;
+  const bool rt4 = gufo::quant::fused::PrefillFourRowTiles();
   const dim3 v2_grid(static_cast<unsigned>(a.ff / 128) * static_cast<unsigned>(a.group_max_items) +
                      shared_wgs);
   if (group) wgs = static_cast<unsigned>(a.n_experts) * (2u * a.ff / 64u) + shared_wgs;
@@ -1543,7 +1585,8 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
     if (v2)                                                                  \
-      gufo::quant::fused::GateUpPrefillKernel<nb><<<v2_grid, kThreads, 0, stream>>>(a); \
+      (rt4 ? gufo::quant::fused::GateUpPrefillKernel<nb, 4>                     \
+           : gufo::quant::fused::GateUpPrefillKernel<nb, 2>)<<<v2_grid, kThreads, 0, stream>>>(a); \
     else if (group && wmma && a.plain_f16)                                   \
       gufo::quant::fused::GateUpWmmaKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else if (group && wmma)                                                  \
@@ -1585,12 +1628,14 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
                         : static_cast<unsigned>(n_tokens) * (a.hidden / 128u) * a.used * 2u);
   const bool share = !group && gufo::quant::fused::ShareExperts(n_tokens, n_tokens * a.used);
   const bool v2 = wmma && a.group_items != nullptr;
+  const bool rt4 = gufo::quant::fused::PrefillFourRowTiles();
   const dim3 v2_grid(static_cast<unsigned>(a.hidden / 256) * static_cast<unsigned>(a.group_max_items));
   switch (a.ff / 128) {
 #define GUFO_I4R_CASE(nb)                                                    \
   case nb:                                                                   \
     if (v2)                                                                  \
-      gufo::quant::fused::DownPrefillKernel<nb><<<v2_grid, kThreads, 0, stream>>>(a); \
+      (rt4 ? gufo::quant::fused::DownPrefillKernel<nb, 4>                       \
+           : gufo::quant::fused::DownPrefillKernel<nb, 2>)<<<v2_grid, kThreads, 0, stream>>>(a); \
     else if (group && wmma && a.plain_f16)                                   \
       gufo::quant::fused::DownWmmaKernel<nb, false><<<grid, kThreads, 0, stream>>>(a); \
     else if (group && wmma)                                                  \
