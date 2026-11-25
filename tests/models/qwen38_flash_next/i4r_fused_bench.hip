@@ -642,7 +642,7 @@ int main(int argc, char** argv) {
   // expert at 512 experts: the dot-product and the matrix-core grouped
   // kernels), checked against per-token runs and timed against the per-slot
   // launches.
-  for (const int kP : {256, 1024}) {
+  for (const int kP : {256, 1024, 2304}) {
     Batch b{};
     b.x = falloc(kP * kHidden);
     b.gate_e = falloc(kP * kUsed * kFf);

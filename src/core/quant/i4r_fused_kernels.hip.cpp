@@ -1194,9 +1194,12 @@ __device__ __forceinline__ void LoadBlockCodes(const std::uint8_t* const codes_r
                                                u32x4 (&c)[RT][4], half2_t (&sc)[RT]) {
 #pragma unroll
   for (int i = 0; i < RT; ++i) {
+    // Ordinary (cached) loads, not non-temporal: the four 16-byte loads of a
+    // row's 64 bytes, and the next block's 64 bytes, share cache lines; with
+    // non-temporal loads the lines were refetched (gate+up 8.4 -> 6.3 ms,
+    // down 5.5 -> 3.7 ms per layer at a 2,304-token chunk on gfx1151).
 #pragma unroll
-    for (int q = 0; q < 4; ++q)
-      c[i][q] = __builtin_nontemporal_load(reinterpret_cast<const u32x4*>(codes_row[i] + b * 64 + q * 16));
+    for (int q = 0; q < 4; ++q) c[i][q] = *reinterpret_cast<const u32x4*>(codes_row[i] + b * 64 + q * 16);
     const _Float16 s1 = __builtin_bit_cast(_Float16, scale_row[i][b]);
     sc[i] = half2_t{s1, s1};
   }
