@@ -86,7 +86,7 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
                           const float* inject_w, float* mixed,
                           __half* mixed_half, void* mixed_q8, float* inject,
                           std::uint32_t n_tokens, std::uint32_t hidden,
-                          hipStream_t stream);
+                          hipStream_t stream, bool hgn = false, bool gate16 = false);
 
 /// res[t][s][i] += block_out[t][i] * 2*sigmoid(inject[t][s] / streams), and
 /// when `gamma` is non-null also the next mixer's grouped RMSNorm of the
@@ -186,6 +186,19 @@ bool HcCombineMoeF16(
 
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
+/// bf16 prompt pass (GUFO_HC_BF16, default on): halogen's arithmetic between sub-layers at
+/// prefill (follow-up spec 4.4): activation of the low-rank values, and the
+/// residual update with the four-stream norm (no deferral, no inject).
+void SiluScaleHgn(float* x, float scale, std::size_t count, hipStream_t stream);
+/// With res16, the residual is read from res16 (from16) or from res, and
+/// written to res16 only (bf16 bit patterns).
+bool HcCombineHgn(float* res, const float* block_out, const float* inject,
+                  std::uint32_t inject_parts, const float* gamma, __half* xn,
+                  std::uint32_t n_tokens, std::uint32_t hidden, float eps,
+                  hipStream_t stream, std::uint16_t* res16 = nullptr,
+                  bool from16 = false);
+/// bf16 bit patterns to f32 (exact).
+void Bf16ToF32(const std::uint16_t* in, float* out, std::size_t n, hipStream_t stream);
 /// SiluScale over `rows` rows of `k` that also writes x's Q8_1 rows, each
 /// `k_padded` wide, to `x_q8` as qfn_mmq_quantize_q8_1 would (the padding
 /// blocks are left as they are). False, with nothing launched, unless k and
@@ -267,10 +280,13 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
 
 /// F16 activation rows [batch][k], Q8_0 weights dequantized to F16 in LDS,
 /// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
+/// EXPERIMENT: round to bf16 precision in place (f32 or f16 storage).
+void RoundBf16InPlace(void* p, std::size_t n, bool half, hipStream_t stream);
 /// input_stride (halves, zero means k): padded input rows, batch >= 1024 only.
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
-                        hipStream_t stream, std::size_t input_stride = 0);
+                        hipStream_t stream, std::size_t input_stride = 0,
+                        std::uint16_t* out16 = nullptr);
 /// input_stride is in half elements; zero means k. Padded rows are supported
 /// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,

@@ -111,6 +111,19 @@ __device__ __forceinline__ float Bf16ToF32(std::uint16_t h) {
   return __uint_as_float(static_cast<std::uint32_t>(h) << 16);
 }
 
+/// halogen's bf16 rounding (follow-up spec 4.4): round to nearest even on
+/// the bit pattern, no NaN/inf special case; the value stays in 32-bit.
+__device__ __forceinline__ float HgnBf16(float x) {
+  std::uint32_t u = __float_as_uint(x);
+  u += 0x7FFFu + ((u >> 16) & 1u);
+  return __uint_as_float(u & 0xFFFF0000u);
+}
+/// halogen's sigmoid (spec 4.4.1 point 2): 1 / (1 + e), e the hardware
+/// base-2 exponential of x * (-log2 e), correctly rounded division.
+__device__ __forceinline__ float HgnSigmoidDen(float x) {
+  return 1.0f + __builtin_amdgcn_exp2f(x * -1.44269504088896341f);
+}
+
 /// Reads element i of a Q8_0 / F32 / BF16 / F16 row.
 __device__ __forceinline__ float RowElement(const void* row, WeightType type,
                                             std::uint32_t i) {
@@ -464,7 +477,7 @@ __device__ __forceinline__ std::int8_t* Q8ActTile(void* base,
 /// One token per block keeps independent rows in flight. The FP32 mixed
 /// row, optional F16/Q8 projection inputs and inject partials share one
 /// read of the four residual streams. Grid: (inject parts, tokens).
-template<bool kMix = true>
+template<bool kMix = true, bool kHgn = false, bool kGate16 = false>
 __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
                                        const float* inject_w, float* mixed,
                                        __half* mixed_half, void* mixed_q8,
@@ -499,11 +512,30 @@ __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
                             (static_cast<std::size_t>(s) * hidden) + i;
     v[s] = live ? Load4(xn + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
     if (kMix && live) {
-      const float4 g = *reinterpret_cast<const float4*>(gate + idx);
-      acc.x += v[s].x * SigmoidF(g.x);
-      acc.y += v[s].y * SigmoidF(g.y);
-      acc.z += v[s].z * SigmoidF(g.z);
-      acc.w += v[s].w * SigmoidF(g.w);
+      float4 g;
+      if constexpr (kGate16) {
+        const ushort4 h = *reinterpret_cast<const ushort4*>(
+            reinterpret_cast<const std::uint16_t*>(gate) + idx);
+        g = float4{Bf16ToF32(h.x), Bf16ToF32(h.y), Bf16ToF32(h.z), Bf16ToF32(h.w)};
+      } else {
+        g = *reinterpret_cast<const float4*>(gate + idx);
+      }
+      if constexpr (kHgn) {
+        // Spec 4.4.2: the up output is bf16; each gate is rounded to bf16;
+        // one fused multiply-add per stream, in stream order, from zero.
+        const auto gt = [](float a) {
+          return HgnBf16(__fdiv_rn(1.0F, HgnSigmoidDen(HgnBf16(a))));
+        };
+        acc.x = __fmaf_rn(v[s].x, gt(g.x), acc.x);
+        acc.y = __fmaf_rn(v[s].y, gt(g.y), acc.y);
+        acc.z = __fmaf_rn(v[s].z, gt(g.z), acc.z);
+        acc.w = __fmaf_rn(v[s].w, gt(g.w), acc.w);
+      } else {
+        acc.x += v[s].x * SigmoidF(g.x);
+        acc.y += v[s].y * SigmoidF(g.y);
+        acc.z += v[s].z * SigmoidF(g.z);
+        acc.w += v[s].w * SigmoidF(g.w);
+      }
     }
   }
   if (kMix && live) {
@@ -511,6 +543,9 @@ __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
     acc.y *= kInvStreams;
     acc.z *= kInvStreams;
     acc.w *= kInvStreams;
+    if constexpr (kHgn) {
+      acc = float4{HgnBf16(acc.x), HgnBf16(acc.y), HgnBf16(acc.z), HgnBf16(acc.w)};
+    }
     *reinterpret_cast<float4*>(mixed + static_cast<std::size_t>(t) * hidden +
                                i) = acc;
     if (mixed_half != nullptr) {
@@ -7179,7 +7214,21 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
                           const float* inject_w, float* mixed,
                           __half* mixed_half, void* mixed_q8, float* inject,
                           std::uint32_t n_tokens, std::uint32_t hidden,
-                          hipStream_t stream) {
+                          hipStream_t stream, bool hgn, bool gate16) {
+  if (hgn && gate16 && hidden % 32 == 0) {
+    hipLaunchKernelGGL((HcMixEpilogueF16Kernel<true, true, true>),
+                       dim3(HcInjectPartsVec4(hidden), n_tokens),
+                       dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
+                       mixed_half, mixed_q8, inject, hidden);
+    return;
+  }
+  if (hgn && hidden % 32 == 0) {
+    hipLaunchKernelGGL((HcMixEpilogueF16Kernel<true, true>),
+                       dim3(HcInjectPartsVec4(hidden), n_tokens),
+                       dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
+                       mixed_half, mixed_q8, inject, hidden);
+    return;
+  }
   if (hidden % 32 == 0) {
     hipLaunchKernelGGL((HcMixEpilogueF16Kernel<>),
                        dim3(HcInjectPartsVec4(hidden), n_tokens),
@@ -7290,6 +7339,108 @@ bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
                      inject, inject_parts, gamma, xn, xn_q8, hidden, eps,
                      prior_out, prior_w, inject_w, inject_out);
   return true;
+}
+
+/// bf16 prompt pass (GUFO_HC_BF16, default on): halogen's residual update and four-stream norm
+/// (follow-up spec 4.4.1 point 3 and 4.4.3). One block of 256 threads per
+/// token; hidden a multiple of 256, at most 2,560. Residual values are kept
+/// in 32-bit storage but always hold bf16 values; xn gets bf16 values (in
+/// f16 storage, exact for the norm's range).
+template<bool kIn16, bool kOut16>
+__global__ __launch_bounds__(256) void HcCombineHgnKernel(
+    float* res, std::uint16_t* res16, const float* block_out, const float* inject,
+    std::uint32_t inject_parts, const float* gamma, __half* xn,
+    std::uint32_t hidden, float eps) {
+  constexpr std::uint32_t kStreams = 4;
+  constexpr std::uint32_t kMaxQ = 10;
+  __shared__ float part[256];
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
+  const std::uint32_t nq = hidden / 256;
+  float* dst = res + static_cast<std::size_t>(t) * hc_dim;
+  std::uint16_t* dst16 = res16 + static_cast<std::size_t>(t) * hc_dim;
+  const float* src = block_out + static_cast<std::size_t>(t) * hidden;
+  for (std::uint32_t s = 0; s < kStreams; ++s) {
+    // Per-stream weight: the down multiply's bf16 logit, x = logit / 4,
+    // 2 * sigmoid(x) (spec 4.4.1 points 1 to 3).
+    float logit = 0.0f;
+    for (std::uint32_t p = 0; p < inject_parts; ++p)
+      logit = __fadd_rn(logit, inject[(static_cast<std::size_t>(t) * kStreams + s) * inject_parts + p]);
+    const float x = HgnBf16(logit) * 0.25f;
+    const float w = 2.0f * __fdiv_rn(1.0f, HgnSigmoidDen(x));
+    float v[kMaxQ];
+    float ss = 0.0f;
+#pragma unroll
+    for (std::uint32_t q = 0; q < kMaxQ; ++q) {
+      if (q >= nq) break;
+      const std::uint32_t i = tid + 256 * q;
+      const std::size_t e = static_cast<std::size_t>(s) * hidden + i;
+      const float y = HgnBf16(src[i]);
+      const float r = kIn16 ? __uint_as_float(static_cast<std::uint32_t>(dst16[e]) << 16)
+                            : HgnBf16(dst[e]);
+      v[q] = HgnBf16(__fmaf_rn(w, y, r));
+      if constexpr (kOut16)
+        dst16[e] = static_cast<std::uint16_t>(__float_as_uint(v[q]) >> 16);
+      else
+        dst[e] = v[q];
+      ss = __fmaf_rn(v[q], v[q], ss);
+    }
+    part[tid] = ss;
+    __syncthreads();
+    for (std::uint32_t h = 128; h > 0; h >>= 1) {
+      if (tid < h) part[tid] = __fadd_rn(part[tid], part[tid + h]);
+      __syncthreads();
+    }
+    const float total = part[0];
+    __syncthreads();
+    if (gamma == nullptr) continue;
+    const float ms = __fadd_rn(__fdiv_rn(total, static_cast<float>(hidden)), eps);
+    const float rs = __builtin_amdgcn_rsqf(ms);
+#pragma unroll
+    for (std::uint32_t q = 0; q < kMaxQ; ++q) {
+      if (q >= nq) break;
+      const std::uint32_t i = tid + 256 * q;
+      const std::size_t e = static_cast<std::size_t>(s) * hidden + i;
+      const float o = HgnBf16(__fmul_rn(__fmul_rn(v[q], rs), gamma[e]));
+      xn[static_cast<std::size_t>(t) * hc_dim + e] = __float2half_rn(o);
+    }
+  }
+}
+
+bool HcCombineHgn(float* res, const float* block_out, const float* inject,
+                  std::uint32_t inject_parts, const float* gamma, __half* xn,
+                  std::uint32_t n_tokens, std::uint32_t hidden, float eps,
+                  hipStream_t stream, std::uint16_t* res16, bool from16) {
+  if (hidden % 256 != 0 || hidden > 2560) return false;
+  const auto kernel = res16 == nullptr ? HcCombineHgnKernel<false, false>
+                      : from16         ? HcCombineHgnKernel<true, true>
+                                       : HcCombineHgnKernel<false, true>;
+  hipLaunchKernelGGL(kernel, dim3(n_tokens), dim3(256), 0, stream, res, res16,
+                     block_out, inject, inject_parts, gamma, xn, hidden, eps);
+  return true;
+}
+
+__global__ void Bf16RowsToF32Kernel(const std::uint16_t* in, float* out, std::size_t n) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < n) out[i] = __uint_as_float(static_cast<std::uint32_t>(in[i]) << 16);
+}
+void Bf16ToF32(const std::uint16_t* in, float* out, std::size_t n, hipStream_t stream) {
+  hipLaunchKernelGGL(Bf16RowsToF32Kernel, dim3(Blocks(n)), dim3(kThreads), 0, stream, in, out, n);
+}
+
+/// bf16 prompt pass (GUFO_HC_BF16, default on): spec 4.4.1 point 4 on the down multiply's
+/// low-rank outputs: v rounded to bf16, x = scale * v, x / (1 + e), bf16.
+__global__ void SiluScaleHgnKernel(float* x, float scale, std::size_t count) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < count) {
+    const float a = __fmul_rn(scale, HgnBf16(x[i]));
+    x[i] = HgnBf16(__fdiv_rn(a, HgnSigmoidDen(a)));
+  }
+}
+void SiluScaleHgn(float* x, float scale, std::size_t count, hipStream_t stream) {
+  hipLaunchKernelGGL(SiluScaleHgnKernel, dim3(Blocks(count)), dim3(kThreads), 0, stream, x,
+                     scale, count);
 }
 
 /// res[t][s][i] += block_out[t][i] * w[t][s], the update a deferring
@@ -7814,7 +7965,8 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     void* mixed_q8 = nullptr, const float* conv_w = nullptr,
     float* conv_out = nullptr, AttentionProjectionOutput attention = {},
     PassCheckpoints checkpoint_rows = {}, std::size_t input_stride = 0,
-    std::uint32_t first_row_tile = 0, std::uint32_t raster_tokens = 0) {
+    std::uint32_t first_row_tile = 0, std::uint32_t raster_tokens = 0,
+    std::uint16_t* y16 = nullptr) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(!(kBf16 && kHalfWeights));
@@ -8388,6 +8540,32 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
               }
             }
           }
+        } else if (y16 != nullptr) {
+          // bf16 prompt pass (GUFO_HC_BF16, default on): bf16 output, halogen's rounding.
+          if (tok < batch) {
+            std::uint32_t pk[8];
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+              const float a = tile_scratch[(tok_l * kOutputStride) + row_l + 2 * q];
+              const float b = tile_scratch[(tok_l * kOutputStride) + row_l + 2 * q + 1];
+              pk[q] = (__float_as_uint(HgnBf16(a)) >> 16) |
+                      (__float_as_uint(HgnBf16(b)) & 0xFFFF0000u);
+            }
+            const std::size_t base = (tok * m) + r0 + static_cast<std::size_t>(row_l);
+            if (r0 + 32 <= m && base % 8 == 0) {
+              auto* dst = reinterpret_cast<uint4*>(y16 + base);
+              dst[0] = uint4{pk[0], pk[1], pk[2], pk[3]};
+              dst[1] = uint4{pk[4], pk[5], pk[6], pk[7]};
+            } else {
+#pragma unroll
+              for (int q = 0; q < 16; ++q) {
+                const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
+                if (r < m)
+                  y16[(tok * m) + r] = static_cast<std::uint16_t>(
+                      (q & 1) ? (pk[q / 2] >> 16) : (pk[q / 2] & 0xFFFFu));
+              }
+            }
+          }
         } else {
           if (tok < batch && r0 + 32 <= m && ((tok * m) % 4 == 0)) {
             auto* dst = reinterpret_cast<float4*>(
@@ -8475,7 +8653,8 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
 
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
-                        hipStream_t stream, std::size_t input_stride) {
+                        hipStream_t stream, std::size_t input_stride,
+                        std::uint16_t* out16) {
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
     return false;
   const bool strided = input_stride != 0 && input_stride != k;
@@ -8498,7 +8677,7 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
           (DenseF16GEMMKernel<128, 64, 2, 4, 2, 1, false, false, false, true>),
           dim3((batch + 63) / 64, (m + 127) / 128), dim3(kThreads), 0, stream,
           w, x, out, batch, m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
-          AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0u, 256u);
+          AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0u, 256u, out16);
       return true;
     }
     if (strided) {
@@ -8508,21 +8687,47 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
           (DenseF16GEMMKernel<128, 128, 2, 2, 4, 1, false, false, false, true, false, true>),
           dim3((batch + 127) / 128, (m + 127) / 128), dim3(kThreads), 0, stream,
           w, x, out, batch, m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
-          AttentionProjectionOutput{}, PassCheckpoints{}, input_stride, 0u, raster);
+          AttentionProjectionOutput{}, PassCheckpoints{}, input_stride, 0u, raster, out16);
       return true;
     }
     hipLaunchKernelGGL(
         (DenseF16GEMMKernel<128, 128, 2, 2, 4, 1, false, false, false, true>),
         dim3((batch + 127) / 128, (m + 127) / 128), dim3(kThreads), 0, stream,
         w, x, out, batch, m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
-        AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0u, raster);
+        AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0u, raster, out16);
     return true;
   }
   hipLaunchKernelGGL(
       (DenseF16GEMMKernel<64, 64, 2, 2, 4, 1, false, false, false, true>),
       dim3((batch + 63) / 64, (m + 63) / 64), dim3(kThreads), 0, stream, w, x,
-      out, batch, m, k);
+      out, batch, m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
+      AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0u, 0u, out16);
   return true;
+}
+
+// EXPERIMENT (GUFO_BF16_EMU): round values to bf16 precision in place
+// (round to nearest even), keeping their storage type.
+__device__ __forceinline__ float RoundBf16(float x) {
+  std::uint32_t u = __builtin_bit_cast(std::uint32_t, x);
+  if ((u & 0x7F800000u) == 0x7F800000u) return x;  // inf/nan
+  u += 0x7FFFu + ((u >> 16) & 1u);
+  return __builtin_bit_cast(float, u & 0xFFFF0000u);
+}
+__global__ void RoundBf16F32Kernel(float* p, std::size_t n) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < n) p[i] = RoundBf16(p[i]);
+}
+__global__ void RoundBf16F16Kernel(__half* p, std::size_t n) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < n) p[i] = __float2half_rn(RoundBf16(__half2float(p[i])));
+}
+void RoundBf16InPlace(void* p, std::size_t n, bool half, hipStream_t stream) {
+  if (p == nullptr || n == 0) return;
+  const dim3 grid(static_cast<unsigned>((n + 255) / 256));
+  if (half)
+    hipLaunchKernelGGL(RoundBf16F16Kernel, grid, dim3(256), 0, stream, static_cast<__half*>(p), n);
+  else
+    hipLaunchKernelGGL(RoundBf16F32Kernel, grid, dim3(256), 0, stream, static_cast<float*>(p), n);
 }
 
 bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,

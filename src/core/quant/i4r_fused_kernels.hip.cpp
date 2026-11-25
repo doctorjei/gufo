@@ -124,6 +124,20 @@ __device__ __forceinline__ float Silu(float x) {
   return x / (1.0f + __expf(-x));
 }
 
+
+/// halogen's bf16 rounding (follow-up spec 4.4): round to nearest even on
+/// the bit pattern, no NaN/inf special case; the value stays in 32-bit.
+__device__ __forceinline__ float HgnBf16(float x) {
+  std::uint32_t u = __float_as_uint(x);
+  u += 0x7FFFu + ((u >> 16) & 1u);
+  return __uint_as_float(u & 0xFFFF0000u);
+}
+/// halogen's sigmoid (spec 4.4.1 point 2): 1 / (1 + e), e the hardware
+/// base-2 exponential of x * (-log2 e), correctly rounded division.
+__device__ __forceinline__ float HgnSigmoidDen(float x) {
+  return 1.0f + __builtin_amdgcn_exp2f(x * -1.44269504088896341f);
+}
+
 __device__ __forceinline__ float Sigmoid(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
@@ -599,6 +613,31 @@ __global__ __launch_bounds__(kThreads) void GateUpGroupKernel(GateUpArgs a) {
 __device__ __forceinline__ void Combine(const DownArgs& a, int token, int tile) {
   const int lane = threadIdx.x & (kWave - 1);
   float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (a.hgn_bf16) {
+    for (int e = 0; e < a.used; ++e) {
+      const int sl = token * a.used + e;
+      const float w = a.weights[sl];
+      // bf16 slot outputs (DownPrefillKernel's hgn store).
+      const std::uint16_t* p = reinterpret_cast<const std::uint16_t*>(a.down_part) +
+                               static_cast<std::size_t>(sl) * a.hidden + tile * 128;
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        sum[j] = __fadd_rn(sum[j], __fmul_rn(w, __uint_as_float(static_cast<std::uint32_t>(p[lane + 32 * j]) << 16)));
+    }
+    Fwht128Wave(sum);
+    const float gate = a.shared_out != nullptr
+                           ? Sigmoid(a.shared_gate[static_cast<std::size_t>(token) * a.shared_gate_stride])
+                           : 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int i = tile * 128 + lane + 32 * j;
+      float o = HgnBf16(__fmul_rn(sum[j], a.sv_down[i]));
+      if (a.shared_out != nullptr)
+        o = HgnBf16(__fmaf_rn(gate, HgnBf16(a.shared_out[static_cast<std::size_t>(token) * a.hidden + i]), o));
+      a.out[static_cast<std::size_t>(token) * a.hidden + i] = o;
+    }
+    return;
+  }
   for (int e = 0; e < a.used; ++e) {
     const int sl = token * a.used + e;
     const float w = a.weights[sl];
@@ -1476,6 +1515,39 @@ __global__ __launch_bounds__(kThreads) void DownPrefillKernel(DownArgs a) {
     }
     __syncthreads();
   }
+  if (a.hgn_bf16) {
+    // Spec 4.4.4 point 1: the slot outputs are stored as bf16 (rotated
+    // basis). Lanes l and l ^ 16 hold rows 2k and 2k + 1 of one token: they
+    // swap, and each stores four bf16 pairs (lanes < 16 k = 0..3, the
+    // others k = 4..7) as 32-bit words.
+    auto* part16 = reinterpret_cast<std::uint16_t*>(a.down_part);
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+      const int r0 = tile * kTileRows + (RT * wr + i) * 16;
+#pragma unroll
+      for (int j = 0; j < TT; ++j) {
+        const int t = (tbase + j) * 16 + (lane & 15);
+        std::uint32_t mine[8], other[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          mine[k] = __float_as_uint(HgnBf16(acc[i][j][k])) >> 16;
+          other[k] = static_cast<std::uint32_t>(__shfl_xor(static_cast<int>(mine[k]), 16, kWave));
+        }
+        if (t >= n_tok) continue;
+        std::uint16_t* p = part16 + static_cast<std::size_t>(a.group_slots[first + t]) * a.hidden + r0;
+        const bool hi = lane >= 16;
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+          const int k = hi ? kk + 4 : kk;
+          // row 2k from the low lane, 2k + 1 from the high lane
+          const std::uint32_t lo_v = hi ? other[k] : mine[k];
+          const std::uint32_t hi_v = hi ? mine[k] : other[k];
+          *reinterpret_cast<std::uint32_t*>(p + 2 * k) = lo_v | (hi_v << 16);
+        }
+      }
+    }
+    return;
+  }
 #pragma unroll
   for (int i = 0; i < RT; ++i) {
     const int r = tile * kTileRows + (RT * wr + i) * 16 + (lane >> 4);
@@ -1627,7 +1699,7 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
 }
 
 bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
-  const I4rDownArgs& a = *args;
+  I4rDownArgs a = *args;
   if (a.ff % 128 != 0 || a.hidden % 128 != 0 || n_tokens <= 0) return false;
   const bool group = a.group_offsets != nullptr;
   const bool wmma = group && gufo::quant::fused::GroupWmma(n_tokens * a.used,
@@ -1636,6 +1708,9 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
                         : static_cast<unsigned>(n_tokens) * (a.hidden / 128u) * a.used * 2u);
   const bool share = !group && gufo::quant::fused::ShareExperts(n_tokens, n_tokens * a.used);
   const bool v2 = wmma && a.group_items != nullptr;
+  // Only the prompt-pass kernels store bf16 slot outputs; the combine must
+  // read what the launched down kernel wrote.
+  if (!v2) a.hgn_bf16 = 0;
   const bool rt4 = gufo::quant::fused::PrefillFourRowTiles();
   const dim3 v2_grid(static_cast<unsigned>(a.hidden / 256) * static_cast<unsigned>(a.group_max_items));
   switch (a.ff / 128) {

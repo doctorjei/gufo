@@ -346,6 +346,7 @@ void RunBatch(const Layer& L, const Batch& b, const std::int32_t* ids, const flo
     dn.group_items = grp->items;
     dn.group_n_items = grp->n_items;
     dn.group_max_items = i4r_prefill_max_tiles(n_tokens * kUsed, static_cast<int>(n_experts));
+    dn.hgn_bf16 = std::getenv("I4R_HGN") != nullptr ? 1 : 0;  // I4R_HGN=1: bf16 slot outputs (halogen prefill store)
   }
   if (!i4r_fused_down(&dn, n_tokens, st)) std::exit(3);
 }

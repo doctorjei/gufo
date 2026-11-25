@@ -887,6 +887,7 @@ private:
     float* res;
     float* xn;
     __half* xn_half;  ///< xn as F16 on the F16 mixer input route
+    std::uint16_t* res16;  ///< bf16 residual of the wide prompt pass
     void* xn_q8t;     ///< xn as tiled Q8 for the W8A8 mixer down projection
     float* lo;
     float* hc_gate;
@@ -1168,6 +1169,15 @@ private:
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.
   mutable bool moe_pending_{false};
+  /// bf16 prompt pass (GUFO_HC_BF16, default on): during a wide prompt pass of res16_n_ rows
+  /// the combines keep the residual in s_.res16 (bf16); res16_live_ marks
+  /// s_.res stale until SyncRes copies it back.
+  mutable bool res16_live_{false};
+  /// When set, the next wide decoded-weight GEMM writes bf16
+  /// bit patterns here instead of f32 (the up multiply under GUFO_HC_BF16).
+  mutable std::uint16_t* wide_out16_{nullptr};
+  mutable std::uint32_t res16_n_{0};
+  void SyncRes() const;
   /// Set before an attention-side combine whose FFN combine fuses the MoE
   /// epilogue: that combine may then leave its residual update to the next
   /// one (res_deferred_), which reads s_.block_out and s_.hc_defer_w.

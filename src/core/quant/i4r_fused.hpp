@@ -93,6 +93,10 @@ struct I4rDownArgs {
   const void* group_items;            ///< as in I4rGateUpArgs
   const std::int32_t* group_n_items;
   int group_max_items;
+  /// bf16 prompt pass (GUFO_HC_BF16, default on): halogen's prefill combine arithmetic
+  /// (follow-up spec 4.4.4): bf16 slot outputs, separate multiply then add,
+  /// bf16 after the rotation and again after the shared expert.
+  int hgn_bf16;
 };
 
 /// Launches gate+up for n_slots = n_tokens * used slots. False when the

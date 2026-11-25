@@ -39,6 +39,33 @@
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
+// EXPERIMENT: GUFO_BF16_EMU bitmask of storage points rounded to bf16
+// precision in place (1 residual, 2 normalised rows, 4 up-multiply output,
+// 8 sub-layer input, 16 decoded dense weights, 32 sub-layer output,
+// 64 dense-multiply inputs). Zero (unset) changes nothing.
+int EmuMask() {
+  static const int mask = [] {
+    const char* v = std::getenv("GUFO_BF16_EMU");
+    return v != nullptr ? static_cast<int>(std::strtol(v, nullptr, 0)) : 0;
+  }();
+  return mask;
+}
+// The wide prompt pass runs the passes between sub-layers with halogen's
+// bf16 arithmetic and storage (follow-up spec 4.4): residual, expert outputs
+// and up-multiply output in bf16, its rounding points and orders.
+// GUFO_HC_BF16=0 restores the previous f32 route.
+bool HcBf16() {
+  static const bool on = [] {
+    const char* v = std::getenv("GUFO_HC_BF16");
+    return v == nullptr || v[0] != '0';
+  }();
+  return on;
+}
+void Emu(int bit, const void* p, std::size_t n, bool half, hipStream_t stream) {
+  if ((EmuMask() & bit) != 0) RoundBf16InPlace(const_cast<void*>(p), n, half, stream);
+}
+
+
 using core::GgmlType;
 
 // Rows past the frontier that must be backed now: tile-rounded attention
@@ -1479,6 +1506,7 @@ bool Executor::CarveRowScratch(
   s.res = f32(T * hc_dim);
   s.xn = f32(T * hc_dim);
   s.xn_half = static_cast<__half*>(bytes(T * hc_dim * sizeof(__half)));
+  s.res16 = static_cast<std::uint16_t*>(bytes(T * hc_dim * sizeof(std::uint16_t)));
   s.xn_q8t = bytes(Q8TiledBytes(T, hc_dim));
   s.lo = f32(T * c.hc_low_rank);
   s.mixed = f32(T * hidden);
@@ -2510,11 +2538,15 @@ bool Executor::WideHgnGemm(const DeviceTensor& w, const float* x, float* out,
     half_cols_ = w.cols;
     half_bf16_ = false;
   }
+  Emu(16, wide_w16_, static_cast<std::size_t>(m) * k, true, stream_);
+  Emu(64, s_.x_half, static_cast<std::size_t>(n) * k, true, stream_);
   // The engine's own f16 GEMM for every width: hipBLASLt's plan for the
   // 6,144-wide output projections ran at about a twelfth of its rate, and
   // this kernel keeps one K order whatever a token's position in the batch.
+  std::uint16_t* out16 = wide_out16_;
+  wide_out16_ = nullptr;
   if (!UnquantizedF16Gemm(wide_w16_, static_cast<const __half*>(s_.x_half), out,
-                          n_tokens, w.rows, w.cols, stream_)) {
+                          n_tokens, w.rows, w.cols, stream_, 0, out16)) {
     AssignError(error_msg, "f16 prefill GEMM refused");
     return false;
   }
@@ -2534,6 +2566,9 @@ bool Executor::WideHgnGemmHalf(const DeviceTensor& w, const __half* x_half, floa
     AssignError(error_msg, "prefill decode failed");
     return false;
   }
+  Emu(16, wide_w16_, static_cast<std::size_t>(m) * k, true, stream_);
+  Emu(64, x_half, static_cast<std::size_t>(n_tokens) * (input_stride != 0 ? input_stride : k), true,
+      stream_);
   if (!UnquantizedF16Gemm(wide_w16_, x_half, out, n_tokens, w.rows, w.cols, stream_,
                           input_stride)) {
     AssignError(error_msg, "f16 prefill GEMM refused");
@@ -2877,9 +2912,29 @@ bool Executor::FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const {
          m.up.cols == c.hc_low_rank;
 }
 
+void Executor::SyncRes() const {
+  // Always called with the row buffers at row 0 (see the last layer's
+  // windows), so res16 and res cover the same rows.
+  if (!res16_live_) return;
+  Bf16ToF32(s_.res16, s_.res, std::size_t{res16_n_} * config().HcDim(), stream_);
+  res16_live_ = false;
+}
+
 void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                        const float* inject_w, const DeviceMixer* next) const {
   const Config& c = config();
+  const bool use16 = HcBf16() && res16_n_ != 0 && res16_n_ == n_tokens && res == s_.res;
+  Emu(1, res, std::size_t{n_tokens} * c.HcDim(), false, stream_);
+  if (!moe_pending_) Emu(32, s_.block_out, std::size_t{n_tokens} * c.hidden_size, false, stream_);
+  struct XnEmu {
+    const Executor* e; std::uint32_t n;
+    ~XnEmu() {
+      if (e->pending_combine_.mixer != nullptr) return;  // combine left to the next mixer
+      const std::size_t count = std::size_t{n} * e->config().HcDim();
+      if (e->xn_half_) Emu(2, e->s_.xn_half, count, true, e->stream_);
+      else Emu(2, e->s_.xn, count, false, e->stream_);
+    }
+  } xn_emu{this, n_tokens};
   inject_fused_ = nullptr;
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
@@ -2894,6 +2949,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   defer_residual_ = false;
   const bool deferred = res_deferred_;
   res_deferred_ = false;
+  if (res16_live_ && !(use16 && xn_half_ && !deferred && !moe_pending_ && !defer))
+    SyncRes();
   if (moe_pending_) {
     // The MoE epilogue was deferred to this combine (see Moe), and with it
     // the previous combine's residual update when that was deferred too.
@@ -2930,6 +2987,14 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     // 4,096 tokens) instead of this combine writing the residual and the
     // next reading it back (168 MB each).
     const bool defer_now = defer && c.hc_count == 4;
+    if (HcBf16() && !defer_now && c.hc_count == 4 &&
+        HcCombineHgn(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half,
+                     n_tokens, c.hidden_size, c.rms_eps, stream_,
+                     use16 ? s_.res16 : nullptr, res16_live_)) {
+      res_deferred_ = false;
+      if (use16) res16_live_ = true;
+      return;
+    }
     res_deferred_ =
         HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma,
                      s_.xn_half, wide_mixer_q6_ ? nullptr : s_.xn_q8t, n_tokens,
@@ -3030,6 +3095,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       c.hidden_size == 2560 && c.hc_low_rank == 320 &&
       m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
       m.up.cols == c.hc_low_rank;
+  bool gate16 = false;  // s_.hc_gate holds bf16 (GUFO_HC_BF16 up multiply)
   if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
     if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
@@ -3064,13 +3130,32 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         return false;
       }
     } else {
-      SiluScale(s_.lo, scale,
-                static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
-      if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
+      if (HcBf16() && xn_half_)
+        SiluScaleHgn(s_.lo, scale, static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+      else
+        SiluScale(s_.lo, scale,
+                  static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+      if (HcBf16() && xn_half_ && m.up.type == GgmlType::kQ6G64 &&
+          WidePrefill(n_tokens) && WideHgn(m.up, n_tokens)) {
+        wide_out16_ = reinterpret_cast<std::uint16_t*>(s_.hc_gate);
+        gate16 = true;
+      }
+      const bool up_ok = Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg);
+      wide_out16_ = nullptr;
+      if (!up_ok) {
         return false;
       }
     }
   }
+  if (!gate16) Emu(4, s_.hc_gate, std::size_t{n_tokens} * c.HcDim(), fused_projection, stream_);
+  struct MixEmu {
+    const Executor* e; float* mixed; std::uint32_t n;
+    ~MixEmu() {
+      const std::size_t count = std::size_t{n} * e->config().hidden_size;
+      Emu(8, mixed, count, false, e->stream_);
+      if (e->half_src_ == mixed) Emu(8, e->s_.x_half, count, true, e->stream_);
+    }
+  } mix_emu{this, mixed, n_tokens};
   const bool fused_inject =
       inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
   // The previous combine already wrote these partials from the same norm.
@@ -3111,7 +3196,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                            fused_inject ? m.inject.f32() : nullptr, mixed,
                            extras ? static_cast<__half*>(s_.x_half) : nullptr,
                            extras && !wide_mixer_q6_ ? s_.x_q8t : nullptr, inject, n_tokens,
-                           c.hidden_size, stream_);
+                           c.hidden_size, stream_, HcBf16(), gate16);
     }
     if (extras) {
       half_src_ = mixed;
@@ -4120,7 +4205,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     dn.used = static_cast<int>(used);
     dn.per_slot_out = rot_per_slot_for_test_ ? 1 : 0;
     dn.plain_f16 = rot_plain_f16_ ? 1 : 0;
+    dn.hgn_bf16 = 0;
     if (grouped) {
+      dn.hgn_bf16 = HcBf16() ? 1 : 0;
       dn.group_offsets = rot_group_offsets_;
       dn.group_slots = rot_group_slots_;
       dn.group_items = rot_group_items_;
@@ -4784,10 +4871,13 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
   for (const auto* checkpoint : checkpoints)
     pass_rows.tokens[pass_rows.count++] = checkpoint->tokens;
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
+  res16_live_ = false;
+  res16_n_ = HcBf16() && WidePrefill(n) && n <= options_.max_batch ? n : 0;
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!session.CheckCancellation(error_msg))
       return false;
     const DeviceLayer& l = layers[il];
+    if (c.IsPleLayer(il) || !normed) SyncRes();
     if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, speculative, error_msg,
                                  embeddings_ready, checkpoints)) {
       return false;
@@ -4864,6 +4954,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return true;
     };
     if (skipped != 0) {
+      // The windows shift the row buffers (RowScratch): settle the bf16
+      // residual into s_.res first, while it still points at row 0.
+      SyncRes();
+      res16_n_ = 0;
       // Row windows to finish: one ending at each checkpoint frontier (at
       // least 96 rows from a 128-row tile start) and the requested tail.
       std::vector<std::pair<std::uint32_t, std::uint32_t>> windows;
@@ -4911,6 +5005,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         !RunLayerHook(session, error_msg))
       return false;
   }
+  SyncRes();
+  res16_n_ = 0;
   if (end_layer < c.num_layers) {
     return true;
   }
