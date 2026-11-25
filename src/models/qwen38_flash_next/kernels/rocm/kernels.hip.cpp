@@ -8408,6 +8408,17 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
     // 0.68 ms at 2,304 tokens), 512 for narrow deep shapes (hc down
     // 320 x 10,240: 0.95 -> 0.88 ms), else the default 4,096.
     const std::uint32_t raster = k <= 640 ? 256u : (m <= 512 && k >= 8192 ? 512u : 0u);
+    if (!strided && m <= 512 && k >= 8192) {
+      // Narrow deep shapes (hyper-connection down, 320 x 10,240): 64-token
+      // tiles double the workgroups (54 -> 108 at 2,304 tokens) and waves of
+      // 32 rows x 32 tokens; outputs bit-identical, 0.94 -> 0.80 ms.
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<128, 64, 2, 4, 2, 1, false, false, false, true>),
+          dim3((batch + 63) / 64, (m + 127) / 128), dim3(kThreads), 0, stream,
+          w, x, out, batch, m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
+          AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0u, 256u);
+      return true;
+    }
     if (strided) {
       // Padded rows (the linear-attention output written in f16 by its own
       // epilogue): the same tiles and K order, only the row addressing.
