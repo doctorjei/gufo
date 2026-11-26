@@ -1226,11 +1226,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
           e->rot_group_slots_ == nullptr || e->rot_group_counters_ == nullptr)
         return nullptr;
     }
-    // EXPERIMENTAL: GUFO_I4R_PLAIN_F16=1 stages the batched kernels' input
-    // as plain f16 (the spec variant) instead of the f16 hi/lo split. Faster,
-    // but ~4e-4 of peak against the f32 path, outside the 1e-4 parity gate.
-    if (const char* v = std::getenv("GUFO_I4R_PLAIN_F16"); v != nullptr && v[0] == '1')
-      e->rot_plain_f16_ = true;
+    // Halogen-format weights stage the batched kernels' input as plain f16
+    // (single-pass 16-bit inputs, as halogen's verify experts); other quants
+    // keep the f16 hi/lo split. GUFO_I4R_PLAIN_F16=0/1 overrides.
+    e->rot_plain_f16_ = e->hgn_model_;
+    if (const char* v = std::getenv("GUFO_I4R_PLAIN_F16"); v != nullptr)
+      e->rot_plain_f16_ = v[0] == '1';
   }
   {
     // Scratch for the ht kernels, sized from every kHT4 matrix the model
