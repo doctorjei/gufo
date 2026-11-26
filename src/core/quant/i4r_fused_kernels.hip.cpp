@@ -931,6 +931,24 @@ constexpr int kWmmaTokens = 32;   // tokens per pass
 __host__ __device__ inline bool GroupWmma(int n_slots, int n_experts) {
   return n_slots >= 16 * n_experts;
 }
+
+// Host-side choice for the grouped launches: the tile-list WMMA kernels skip
+// empty tiles and unfilled 16-token groups, so they serve every grouped batch
+// (halogen also runs its tile kernel at every prompt length). The older
+// threshold, 16 slots per expert on average, can be restored for comparison
+// with GUFO_GROUP_WMMA_MIN_SLOTS=8192 (read once). Only for single-pass f16
+// inputs (halogen-format weights).
+inline bool GroupWmmaLaunch(int n_slots, int n_experts, bool tile_list, bool plain_f16) {
+  static const long min_slots = [] {
+    const char* e = std::getenv("GUFO_GROUP_WMMA_MIN_SLOTS");
+    return e != nullptr ? std::strtol(e, nullptr, 10) : -1L;
+  }();
+  // Other quants (two-part inputs) keep the older threshold, so their results
+  // are unchanged.
+  if (!tile_list || !plain_f16) return GroupWmma(n_slots, n_experts);
+  return min_slots < 0 ? n_slots > 0 : n_slots >= min_slots;
+}
+
 constexpr int kWmmaStride = 136;  // halves per LDS row (128 + 8 against bank conflicts)
 
 struct WmmaLds {
@@ -1663,7 +1681,8 @@ bool i4r_fused_gate_up(const I4rGateUpArgs* args, int n_slots, hipStream_t strea
   unsigned wgs = static_cast<unsigned>(n_slots) * (2u * a.ff / 64u) + shared_wgs;
   const bool group = a.group_offsets != nullptr;
   const bool wmma =
-      group && gufo::quant::fused::GroupWmma(n_slots, static_cast<int>(a.n_experts));
+      group && gufo::quant::fused::GroupWmmaLaunch(n_slots, static_cast<int>(a.n_experts),
+                                                   a.group_items != nullptr, a.plain_f16 != 0);
   if (wmma && (a.group_xr_hi == nullptr || (!a.plain_f16 && a.group_xr_lo == nullptr)))
     return false;
   // Prefill v2 (tile work list, single-pass f16) when the work list is given.
@@ -1715,8 +1734,9 @@ bool i4r_fused_down(const I4rDownArgs* args, int n_tokens, hipStream_t stream) {
   I4rDownArgs a = *args;
   if (a.ff % 128 != 0 || a.hidden % 128 != 0 || n_tokens <= 0) return false;
   const bool group = a.group_offsets != nullptr;
-  const bool wmma = group && gufo::quant::fused::GroupWmma(n_tokens * a.used,
-                                                           static_cast<int>(a.n_experts));
+  const bool wmma = group && gufo::quant::fused::GroupWmmaLaunch(n_tokens * a.used,
+                                                                 static_cast<int>(a.n_experts),
+                                                                 a.group_items != nullptr, a.plain_f16 != 0);
   const dim3 grid(group ? static_cast<unsigned>(a.n_experts) * (a.hidden / 128u) * 2u
                         : static_cast<unsigned>(n_tokens) * (a.hidden / 128u) * a.used * 2u);
   const bool share = !group && gufo::quant::fused::ShareExperts(n_tokens, n_tokens * a.used);
