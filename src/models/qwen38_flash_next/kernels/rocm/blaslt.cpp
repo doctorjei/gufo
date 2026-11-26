@@ -22,9 +22,13 @@ bool OwnF16(hipDataType type, int k) {
 }
 
 bool OwnBf16(hipDataType type, int m, int k) {
-  // The indexer query and key projections, and a TP2 rank's halves.
-  return type == HIP_R_16BF && k == 2560 &&
-         (m == 512 || m == 256 || m == 128 || m == 64);
+  // The indexer query and key projections, and a TP2 rank's halves; and the
+  // wide once-per-pass projections (per-layer embedding key and value), where
+  // the library's heuristic picks 32 x 32 macro tiles (21.5 ms against about
+  // 6 ms for the engine's 64 x 128 tiles at a 2,304-token pass).
+  return type == HIP_R_16BF &&
+         ((k == 2560 && (m == 512 || m == 256 || m == 128 || m == 64)) ||
+          (m >= 1024 && k % 32 == 0));
 }
 
 }  // namespace
