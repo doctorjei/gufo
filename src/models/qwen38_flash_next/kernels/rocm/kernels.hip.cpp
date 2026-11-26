@@ -8668,7 +8668,11 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
     // 256 tokens for shallow K (hyper-connection up 10,240 x 320: 1.30 ->
     // 0.68 ms at 2,304 tokens), 512 for narrow deep shapes (hc down
     // 320 x 10,240: 0.95 -> 0.88 ms), else the default 4,096.
-    const std::uint32_t raster = k <= 640 ? 256u : (m <= 512 && k >= 8192 ? 512u : 0u);
+    // 1,024 for the linear-attention qkv shape (10,240 x 2,560: 3.65 -> 3.47 ms).
+    const std::uint32_t raster = k <= 640                   ? 256u
+                                 : m <= 512 && k >= 8192    ? 512u
+                                 : m == 10240 && k == 2560 ? 1024u
+                                                           : 0u;
     if (!strided && m <= 512 && k >= 8192) {
       // Narrow deep shapes (hyper-connection down, 320 x 10,240): 64-token
       // tiles double the workgroups (54 -> 108 at 2,304 tokens) and waves of
