@@ -466,7 +466,7 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
                    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
-                   hipEvent_t z_ready = nullptr);
+                   hipEvent_t z_ready = nullptr, bool chunked = false);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.

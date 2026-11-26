@@ -9174,6 +9174,418 @@ void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,
                      destination, tokens, channels, history_rows);
 }
 
+// ---------------------------------------------------------------------------
+// Chunked gated delta rule in halogen's form (chunked-recurrence spec d1,
+// prefill follow-up spec 5.8): the prompt in chunks of 16 positions, one
+// workgroup per value head, 8 waves each owning 16 of the 128 value columns
+// of the 32-bit state (registers, 256 x value). Five phases per chunk:
+//  1 bf16 q and k (read during the previous chunk) to shared memory, their
+//    norms, the running decay G (wave 0); this chunk's values requested;
+//  2 next chunk's q and k requested; A (wave 0) and P (wave 1) from the
+//    unscaled bf16 products with the norms applied per entry; e, d and
+//    16 b e r_k (wave 2);
+//  3 T = (I + A)^-1 in 32-bit (16 lanes of wave 0), stored as two scaled
+//    copies (T diag(16 b e r_k) and T diag(b)) of two half-precision parts;
+//    waves 1-7 form the transposed update keys and the scaled queries,
+//    waves 2-7 finish the previous chunk's output norm and gate;
+//  4 W = T diag(16 b e r_k) k and T b v, each as two matrix products;
+//  5 W S and q S per 16-key state tile, U, P U, the bf16 outputs and the
+//    state update.
+// Half-precision operands are 16 x value; products carry 256.
+// ---------------------------------------------------------------------------
+constexpr int kGdnChunk = 16;
+#ifdef GUFO_GDN_CHUNK_PROFILE
+__device__ unsigned long long g_gdn_chunk_prof[8];
+#define GDN_PROF(slot) \
+  do { \
+    if (blockIdx.x == 0 && threadIdx.x == 0) { \
+      const unsigned long long now_ = __builtin_readcyclecounter(); \
+      g_gdn_chunk_prof[slot] += now_ - prof_t; \
+      prof_t = now_; \
+    } \
+  } while (0)
+#else
+#define GDN_PROF(slot) do { } while (0)
+#endif
+
+/// Lane l ^ 16's value, in registers (v_permlanex16 with identity selects).
+__device__ __forceinline__ float GdnSwapHalves(float x) {
+  const int v = __builtin_bit_cast(int, x);
+  return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false));
+}
+/// x plus lane l ^ kMask's x, kMask < 16 (DPP row xmask, no shared memory).
+template<int kMask>
+__device__ __forceinline__ float GdnXorAdd(float x) {
+  const int y = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, x), 0x160 | kMask, 0xF, 0xF, false);
+  return x + __builtin_bit_cast(float, y);
+}
+
+/// B fragment (K = accumulator rows, N = this lane's column) of a 16 x 16
+/// accumulator, scaled: lanes l and l ^ 16 hold the even and odd rows.
+__device__ __forceinline__ v16h GdnAccToB(const v8f& x, float scale) {
+  v16h f;
+  const bool hi = (threadIdx.x & 16u) != 0;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const float own = x[e] * scale;
+    const float oth = GdnSwapHalves(own);
+    f[2 * e] = static_cast<_Float16>(hi ? oth : own);
+    f[2 * e + 1] = static_cast<_Float16>(hi ? own : oth);
+  }
+  return f;
+}
+
+/// 16 consecutive 16-bit values (32 bytes, 16-byte aligned) as one fragment.
+__device__ __forceinline__ v16h GdnLoad16(const void* p) {
+  v16h f;
+  const uint4* s = reinterpret_cast<const uint4*>(p);
+  const uint4 a = s[0], b = s[1];
+  __builtin_memcpy(&f, &a, 16);
+  __builtin_memcpy(reinterpret_cast<char*>(&f) + 16, &b, 16);
+  return f;
+}
+
+__device__ __forceinline__ float GdnBf16Value(std::uint16_t bits) {
+  return __uint_as_float(static_cast<std::uint32_t>(bits) << 16);
+}
+__device__ __forceinline__ std::uint16_t GdnBf16Bits(float x) {
+  return static_cast<std::uint16_t>(__float_as_uint(HgnBf16(x)) >> 16);
+}
+__device__ __forceinline__ std::uint16_t GdnHalfBits(float x) {
+  return __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(x));
+}
+
+// 192 registers per lane (as halogen): two 8-wave workgroups then share a
+// CU, so all 48 heads run at once on a 40-CU device (at 256 the 41st waits).
+template<GdnOutput kOutput>
+__launch_bounds__(256) __attribute__((amdgpu_num_vgpr(192))) __global__ void GdnChunkKernel(
+    const float* conv_out, const float* alpha_beta, const float* a, const float* dt,
+    const float* z, std::uint32_t z_stride, const float* norm_w, float* state, float* out,
+    void* out_q8, __half* out_half, void* out_q8_1, std::uint32_t out_half_stride,
+    std::uint32_t n_tokens, std::uint32_t k_heads, std::uint32_t v_heads, float eps,
+    GdnCheckpoint checkpoint) {
+  constexpr int d = kGdnDim;
+  constexpr int C = kGdnChunk;
+  constexpr int LD = d + 8;  // 272-byte rows of 128 16-bit values
+  constexpr int LT = C + 8;  // 48-byte rows of 16 16-bit values
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int half = lane >> 4, l16 = lane & 15;
+  const int kh = h % static_cast<int>(k_heads);
+  const int channels = 2 * static_cast<int>(k_heads) * d + static_cast<int>(v_heads) * d;
+  const int n = static_cast<int>(n_tokens);
+  // Shared memory: the nine regions of spec d1 table 4.2 (28,864 bytes).
+  __shared__ __attribute__((aligned(16))) std::uint16_t s_k[C][LD];  // keys, bf16
+  __shared__ __attribute__((aligned(16))) std::uint16_t s_q[C][LD];  // queries: bf16, then half 16 r_q q
+  __shared__ float s_b[C], s_G[C], s_d[C], s_e[C], s_rk[C], s_fw[C], s_rq[C];
+  __shared__ float s_A[C][C];
+  __shared__ __attribute__((aligned(16))) _Float16 s_P[C][LT];
+  __shared__ __attribute__((aligned(16))) _Float16 s_kdT[d][LT];
+  __shared__ __attribute__((aligned(16))) _Float16 s_T[4][C][LT];
+  __shared__ __attribute__((aligned(16))) _Float16 s_w[C][LD];
+  __shared__ __attribute__((aligned(16))) std::uint16_t s_o[C][LD];  // outputs, bf16
+
+  // State tile t (keys 16t..16t+15) x this wave's 16 value columns, as 256 x
+  // value: element e of lane l is key 16t + 2e + half, column 16 wave + l16.
+  v8f S[8];
+  const int col = 16 * wave + l16;
+#pragma unroll
+  for (int t = 0; t < 8; ++t)
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+      S[t][e] = 256.0f * state[(static_cast<std::size_t>(h) * d + col) * d + 16 * t + 2 * e + half];
+  const float a_h = a[h], dt_h = dt[h];
+
+  // Next chunk's q and k: position tid / 16, values 8 (tid % 16) .. + 7.
+  // Held as bf16 pairs (halogen's inputs are bf16; rounding at fetch is the
+  // rounding phase 1 applies).
+  std::uint32_t pq[4], pk[4];
+  const auto pack2 = [](float x, float y) {
+    return static_cast<std::uint32_t>(GdnBf16Bits(x)) | (static_cast<std::uint32_t>(GdnBf16Bits(y)) << 16);
+  };
+  const auto fetch_qk = [&](int cc, int pi, int pj) {
+    const int tok = cc * C + pi;
+    const float* row = conv_out + static_cast<std::size_t>(min(tok, n - 1)) * channels;
+    const float4* q4 = reinterpret_cast<const float4*>(row + kh * d + pj);
+    const float4* k4 = reinterpret_cast<const float4*>(row + (static_cast<int>(k_heads) + kh) * d + pj);
+    const float4 qa = q4[0], qb = q4[1], ka = k4[0], kb = k4[1];
+    const bool live = tok < n;
+    const float qv[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+    const float kv[8] = {ka.x, ka.y, ka.z, ka.w, kb.x, kb.y, kb.z, kb.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      pq[j] = live ? pack2(qv[2 * j], qv[2 * j + 1]) : 0u;
+      pk[j] = live ? pack2(kv[2 * j], kv[2 * j + 1]) : 0u;
+    }
+  };
+  // Next chunk's raw gates: wave 0, lane = position.
+  float pg = 0.0f, pb = 0.0f;
+  bool plive = false;
+  const auto fetch_gates = [&](int cc) {
+    if (wave == 0 && lane < C) {
+      const int tok = cc * C + lane;
+      plive = tok < n;
+      const std::size_t gi = static_cast<std::size_t>(min(tok, n - 1)) * 2 * v_heads + h;
+      pg = alpha_beta[gi];
+      pb = alpha_beta[gi + v_heads];
+    }
+  };
+  // This chunk's values, this lane's column, positions 0..15.
+  std::uint32_t pv[C / 2];
+  const auto fetch_v = [&](int cc, int col) {
+    const float* vp = conv_out + (2 * static_cast<int>(k_heads) + h) * d + col;
+#pragma unroll
+    for (int i = 0; i < C; i += 2) {
+      const int tok = cc * C + i;
+      const float x = tok < n ? vp[static_cast<std::size_t>(tok) * channels] : 0.0f;
+      const float y = tok + 1 < n ? vp[static_cast<std::size_t>(tok + 1) * channels] : 0.0f;
+      pv[i / 2] = pack2(x, y);
+    }
+  };
+  // Output norm and gate of chunk cc's rows (s_o), waves first.. first+waves-1.
+  const auto finish = [&](int cc, int first_wave, int waves, int lane) {
+    float nw[d / 32];
+#pragma unroll
+    for (int r = 0; r < d / 32; ++r) nw[r] = norm_w[r * 32 + lane];
+    for (int i = wave - first_wave; i < C; i += waves) {
+      if (i < 0) break;
+      const int t = cc * C + i;
+      if (t >= n) break;
+      float v[d / 32], zv[d / 32];
+      const float* zr = z + static_cast<std::size_t>(t) * z_stride + h * d;
+#pragma unroll
+      for (int rr = 0; rr < d / 32; ++rr) {
+        v[rr] = GdnBf16Value(s_o[i][rr * 32 + lane]);
+        zv[rr] = HgnBf16(zr[rr * 32 + lane]);
+      }
+      GdnEpilogueRow(v, zv, nw, static_cast<std::size_t>(t) * v_heads + h, lane, v_heads, eps,
+                     out, kOutput == GdnOutput::kQ8 ? out_q8 : nullptr,
+                     kOutput == GdnOutput::kHalf ? out_half : nullptr,
+                     kOutput == GdnOutput::kF32Q8_1 ? out_q8_1 : nullptr, out_half_stride);
+    }
+  };
+
+  fetch_qk(0, tid >> 4, (tid & 15) * 8);
+  fetch_gates(0);
+  const int n_chunks = (n + C - 1) / C;
+#ifdef GUFO_GDN_CHUNK_PROFILE
+  unsigned long long prof_t = __builtin_readcyclecounter();
+#endif
+  for (int c = 0; c < n_chunks; ++c) {
+    const int t0 = c * C;
+    // Lane indices made opaque per chunk: shared-memory addresses are then
+    // recomputed in each phase instead of being held (and spilled) as
+    // loop-invariant registers for the whole walk.
+    int tid_o = tid;
+    asm volatile("" : "+v"(tid_o));
+    const int lane = tid_o & 31, half = lane >> 4, l16 = lane & 15;
+    const int col = 16 * wave + l16, pi = tid_o >> 4, pj = (tid_o & 15) * 8;
+    // ---- Phase 1 ----
+    fetch_v(c, col);
+    {
+      float qs = 0.0f, ks = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint16_t qbits = static_cast<std::uint16_t>(pq[j / 2] >> (16 * (j & 1)));
+        const std::uint16_t kbits = static_cast<std::uint16_t>(pk[j / 2] >> (16 * (j & 1)));
+        const float qb = GdnBf16Value(qbits), kb = GdnBf16Value(kbits);
+        s_q[pi][pj + j] = qbits;
+        s_k[pi][pj + j] = kbits;
+        qs = j == 0 ? qb * qb : __builtin_fmaf(qb, qb, qs);
+        ks = j == 0 ? kb * kb : __builtin_fmaf(kb, kb, ks);
+      }
+      qs = GdnXorAdd<1>(qs);
+      ks = GdnXorAdd<1>(ks);
+      qs = GdnXorAdd<2>(qs);
+      ks = GdnXorAdd<2>(ks);
+      qs = GdnXorAdd<4>(qs);
+      ks = GdnXorAdd<4>(ks);
+      qs = GdnXorAdd<8>(qs);
+      ks = GdnXorAdd<8>(ks);
+      if ((tid & 15) == 0) {
+        s_rk[pi] = rsqrtf(ks + eps);
+        s_rq[pi] = rsqrtf(qs + eps) * rsqrtf(static_cast<float>(d));
+      }
+    }
+    if (wave == 0) {
+      const bool live = lane < C && plive;
+      const float g = live ? a_h * SoftplusF(pg + dt_h) : 0.0f;
+      float G = 0.0f, mine = 0.0f;
+#pragma unroll
+      for (int m = 0; m < C; ++m) {
+        const float gm = __shfl(g, m, 32);
+        G = m == 0 ? gm : G + gm;
+        if (lane == m) mine = G;
+      }
+      if (lane < C) {
+        s_G[lane] = mine;
+        s_b[lane] = live ? SigmoidF(pb) : 0.0f;
+      }
+    }
+    __syncthreads();
+    GDN_PROF(0);
+    // ---- Phase 2 ----
+    if (c + 1 < n_chunks) {
+      fetch_qk(c + 1, pi, pj);
+      fetch_gates(c + 1);
+    }
+    if (wave < 2) {
+      // k k^T (wave 0) and q k^T (wave 1) from the unscaled bf16 rows.
+      v8f acc = {};
+#pragma unroll
+      for (int t = 0; t < 8; ++t) {
+        const v16h kb = GdnLoad16(&s_k[l16][16 * t]);
+        const v16h xa = wave == 0 ? kb : GdnLoad16(&s_q[l16][16 * t]);
+        acc = WmmaBf16(xa, kb, acc);
+      }
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int i = 2 * e + half, j = l16;
+        const float eij = __expf(s_G[i] - s_G[j]);
+        if (wave == 0)
+          s_A[i][j] = j < i ? acc[e] * s_rk[i] * s_rk[j] * s_b[i] * eij : 0.0f;
+        else
+          s_P[i][j] = static_cast<_Float16>(j <= i ? 16.0f * (acc[e] * s_rq[i] * s_rk[j] * eij) : 0.0f);
+      }
+    } else if (wave == 2 && lane < C) {
+      const float e = __expf(s_G[lane]);
+      s_e[lane] = e;
+      s_d[lane] = __expf(s_G[C - 1] - s_G[lane]);
+      s_fw[lane] = 16.0f * s_b[lane] * e * s_rk[lane];
+    }
+    __syncthreads();
+    GDN_PROF(1);
+    // ---- Phase 3 ----
+    if (wave == 0) {
+      if (lane < C) {
+        // Column j of T = (I + A)^-1 in 32-bit registers.
+        const int j = lane;
+        float tc[C];
+#pragma unroll
+        for (int i = 0; i < C; ++i) {
+          float acc = i == j ? 1.0f : 0.0f;
+#pragma unroll
+          for (int m = 0; m < i; ++m) acc = __builtin_fmaf(-s_A[i][m], tc[m], acc);
+          tc[i] = i < j ? 0.0f : acc;
+          asm volatile("" ::: "memory");  // one row of A in flight
+        }
+        const float fw = s_fw[j], bj = s_b[j];
+#pragma unroll
+        for (int i = 0; i < C; ++i) {
+          const float x = tc[i] * fw, y = tc[i] * bj;
+          const _Float16 xh = static_cast<_Float16>(x), yh = static_cast<_Float16>(y);
+          s_T[0][i][j] = xh;
+          s_T[1][i][j] = static_cast<_Float16>(x - static_cast<float>(xh));
+          s_T[2][i][j] = yh;
+          s_T[3][i][j] = static_cast<_Float16>(y - static_cast<float>(yh));
+        }
+      }
+    } else {
+      const int u = tid - 32;  // 0..223
+      if (u < d) {
+        // Update keys, transposed: k(i) 16 r_k(i) d(i), one key row per lane.
+        const int m = u;
+        _Float16 kd[C];
+#pragma unroll
+        for (int i = 0; i < C; ++i)
+          kd[i] = static_cast<_Float16>(GdnBf16Value(s_k[i][m]) * (16.0f * s_rk[i] * s_d[i]));
+        uint4 lo, hi;
+        __builtin_memcpy(&lo, &kd[0], 16);
+        __builtin_memcpy(&hi, &kd[8], 16);
+        uint4* dst = reinterpret_cast<uint4*>(&s_kdT[m][0]);
+        dst[0] = lo;
+        dst[1] = hi;
+      }
+      // Queries for q S, in place: q(i) 16 r_q(i) / sqrt(d).
+      for (int idx = u; idx < C * d; idx += 224) {
+        const int i = idx >> 7, m = idx & (d - 1);
+        s_q[i][m] = GdnHalfBits(GdnBf16Value(s_q[i][m]) * (16.0f * s_rq[i]));
+      }
+      if (c > 0 && wave >= 2) finish(c - 1, 2, 6, lane);
+    }
+    __syncthreads();
+    GDN_PROF(2);
+    // ---- Phase 4 ----
+    v8f TBV = {};
+    {
+      // W tile: this wave's 16 key columns.
+      v16h kb;
+#pragma unroll
+      for (int i = 0; i < C; ++i) kb[i] = static_cast<_Float16>(GdnBf16Value(s_k[i][col]));
+      v8f acc = {};
+      acc = Wmma(GdnLoad16(&s_T[0][l16][0]), kb, acc);
+      acc = Wmma(GdnLoad16(&s_T[1][l16][0]), kb, acc);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) s_w[2 * e + half][col] = static_cast<_Float16>(acc[e]);
+      // T b v for this wave's value columns, from the registers of phase 1.
+      v16h vb;
+#pragma unroll
+      for (int i = 0; i < C; ++i)
+        vb[i] = static_cast<_Float16>(GdnBf16Value(static_cast<std::uint16_t>(pv[i / 2] >> (16 * (i & 1)))));
+      TBV = Wmma(GdnLoad16(&s_T[2][l16][0]), vb, TBV);
+      TBV = Wmma(GdnLoad16(&s_T[3][l16][0]), vb, TBV);
+    }
+    __syncthreads();
+    GDN_PROF(3);
+    // ---- Phase 5 ----
+    {
+      v8f WS = {}, QS = {};
+#pragma unroll
+      for (int t = 0; t < 8; ++t) {
+        const v16h sb = GdnAccToB(S[t], 1.0f / 16.0f);
+        WS = Wmma(GdnLoad16(&s_w[l16][16 * t]), sb, WS);
+        QS = Wmma(GdnLoad16(&s_q[l16][16 * t]), sb, QS);
+        asm volatile("" ::: "memory");  // one tile of operands in flight
+      }
+      v8f U;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) U[e] = TBV[e] - WS[e] * (1.0f / 256.0f);
+      const v16h ub = GdnAccToB(U, 16.0f);
+      v8f PU = {};
+      PU = Wmma(GdnLoad16(&s_P[l16][0]), ub, PU);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int i = 2 * e + half;
+        const float o = (s_e[i] * QS[e] + PU[e]) * (1.0f / 256.0f);
+        s_o[i][col] = GdnBf16Bits(o);
+      }
+      const float e16 = __expf(s_G[C - 1]);
+#pragma unroll
+      for (int t = 0; t < 8; ++t) {
+        v8f D = {};
+        D = Wmma(GdnLoad16(&s_kdT[16 * t + l16][0]), ub, D);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) S[t][e] = __builtin_fmaf(e16, S[t][e], D[e]);
+        asm volatile("" ::: "memory");
+      }
+    }
+    if (float* const captured = CheckpointState(checkpoint, static_cast<std::uint32_t>(min(t0 + C, n)))) {
+#pragma unroll
+      for (int t = 0; t < 8; ++t)
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+          captured[(static_cast<std::size_t>(h) * d + col) * d + 16 * t + 2 * e + half] = S[t][e] * (1.0f / 256.0f);
+    }
+    __syncthreads();
+    GDN_PROF(4);
+  }
+#pragma unroll
+  for (int t = 0; t < 8; ++t)
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+      state[(static_cast<std::size_t>(h) * d + col) * d + 16 * t + 2 * e + half] = S[t][e] * (1.0f / 256.0f);
+  finish(n_chunks - 1, 0, 8, lane);
+}
+
+#ifdef GUFO_GDN_CHUNK_PROFILE
+void GdnChunkProfile(unsigned long long* out, bool reset) {
+  (void)hipMemcpyFromSymbol(out, HIP_SYMBOL(g_gdn_chunk_prof), sizeof(unsigned long long) * 8);
+  if (reset) {
+    unsigned long long z[8] = {};
+    (void)hipMemcpyToSymbol(HIP_SYMBOL(g_gdn_chunk_prof), z, sizeof(z));
+  }
+}
+#endif
 bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
@@ -9186,7 +9598,7 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half, GdnCheckpoint checkpoint,
                    std::uint32_t out_half_stride, void* out_q8_1,
-                   hipEvent_t z_ready) {
+                   hipEvent_t z_ready, bool chunked) {
   // The recurrence kernels below address state with the compile-time
   // kGdnDim, never with this function's runtime `d`. A head dimension that
   // differs makes them read and write past the state buffer the host sized
@@ -9246,6 +9658,11 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
     if (z_ready != nullptr &&
         hipStreamWaitEvent(stream, z_ready, 0) != hipSuccess)
       return false;
+    // The chunked form saves state only at chunk ends: a checkpoint elsewhere
+    // keeps the token kernel for this pass.
+    bool chunk_ok = chunked;
+    for (std::uint32_t i = 0; i < checkpoint.count; ++i)
+      chunk_ok = chunk_ok && (checkpoint.tokens[i] % kGdnChunk == 0 || checkpoint.tokens[i] == n_tokens);
     const auto launch = [&](auto kernel) {
       hipLaunchKernelGGL(kernel, dim3(v_heads), dim3(kGdnPrefillWaves * 32), 0,
                          stream, conv_scratch, alpha_beta, a, dt, z, z_stride,
@@ -9253,6 +9670,18 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                          out_half_stride, n_tokens, k_heads, v_heads, eps,
                          checkpoint);
     };
+    if (chunk_ok) {
+      if (out_q8 != nullptr) {
+        launch(GdnChunkKernel<GdnOutput::kQ8>);
+      } else if (out_half != nullptr) {
+        launch(GdnChunkKernel<GdnOutput::kHalf>);
+      } else if (out_q8_1_rows != nullptr) {
+        launch(GdnChunkKernel<GdnOutput::kF32Q8_1>);
+      } else {
+        launch(GdnChunkKernel<GdnOutput::kF32>);
+      }
+      return true;
+    }
     if (out_q8 != nullptr) {
       launch(GdnPrefillKernel<GdnOutput::kQ8>);
     } else if (out_half != nullptr) {
