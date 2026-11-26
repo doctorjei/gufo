@@ -613,16 +613,23 @@ __global__ __launch_bounds__(kThreads) void GateUpGroupKernel(GateUpArgs a) {
 __device__ __forceinline__ void Combine(const DownArgs& a, int token, int tile) {
   const int lane = threadIdx.x & (kWave - 1);
   float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  if (a.hgn_bf16) {
+  if (a.hgn_bf16 || a.hgn_decode) {
     for (int e = 0; e < a.used; ++e) {
       const int sl = token * a.used + e;
       const float w = a.weights[sl];
-      // bf16 slot outputs (DownPrefillKernel's hgn store).
-      const std::uint16_t* p = reinterpret_cast<const std::uint16_t*>(a.down_part) +
-                               static_cast<std::size_t>(sl) * a.hidden + tile * 128;
+      if (a.hgn_bf16) {
+        // bf16 slot outputs (DownPrefillKernel's hgn store).
+        const std::uint16_t* p = reinterpret_cast<const std::uint16_t*>(a.down_part) +
+                                 static_cast<std::size_t>(sl) * a.hidden + tile * 128;
 #pragma unroll
-      for (int j = 0; j < 4; ++j)
-        sum[j] = __fadd_rn(sum[j], __fmul_rn(w, __uint_as_float(static_cast<std::uint32_t>(p[lane + 32 * j]) << 16)));
+        for (int j = 0; j < 4; ++j)
+          sum[j] = __fadd_rn(sum[j], __fmul_rn(w, __uint_as_float(static_cast<std::uint32_t>(p[lane + 32 * j]) << 16)));
+      } else {
+        // decode: 32-bit slot outputs (spec 4.6.4 point 1).
+        const float* p = a.down_part + static_cast<std::size_t>(sl) * a.hidden + tile * 128;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) sum[j] = __fadd_rn(sum[j], __fmul_rn(w, LoadPartial(p + lane + 32 * j)));
+      }
     }
     Fwht128Wave(sum);
     const float gate = a.shared_out != nullptr
@@ -737,6 +744,12 @@ __global__ __launch_bounds__(kThreads) void DownKernel(DownArgs a) {
   if (!LastArrival(a.counters + token * tiles + tile, static_cast<unsigned>(per_tile)))
     return;
   if (tid >= kWave) return;
+  if (a.hgn_decode) {
+    // halogen decode combine (spec 4.6.4), the same function the verify
+    // kernels use, so one token gets one result at every batch width.
+    Combine(a, token, tile);
+    return;
+  }
 
   const int lane = tid;
   float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};

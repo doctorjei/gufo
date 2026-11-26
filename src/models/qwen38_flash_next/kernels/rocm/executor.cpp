@@ -61,6 +61,15 @@ bool HcBf16() {
   }();
   return on;
 }
+// halogen's decode boundary (follow-up spec 4.6.1) for batches below the wide
+// route; same switch as the bf16 prompt pass.
+bool HgnDecodeOn(std::uint32_t n_tokens) {
+  static const bool on = [] {
+    const char* v = std::getenv("GUFO_HGN_DECODE");
+    return v == nullptr || v[0] != '0';
+  }();
+  return on && HcBf16() && n_tokens >= 1 && n_tokens <= 64;
+}
 void Emu(int bit, const void* p, std::size_t n, bool half, hipStream_t stream) {
   if ((EmuMask() & bit) != 0) RoundBf16InPlace(const_cast<void*>(p), n, half, stream);
 }
@@ -1173,6 +1182,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     any_split = any_split || layer.rot_split;
   };
   for (const auto& layer : model.layers()) note_layer(layer);
+  // halogen-format weights (rotated experts, q6g64 hyper-connection mixers):
+  // only these take halogen's bf16 arithmetic (GUFO_HC_BF16) and decode
+  // boundary; every other quant keeps its own route.
+  e->hgn_model_ = any_rotated && !model.layers().empty() &&
+                  model.layers().front().hc_attn.down.type == GgmlType::kQ6G64;
   if (model.has_mtp()) note_layer(model.mtp());
   e->rotated_experts_ = any_rotated;
   e->host_routed_experts_ = any_host_routed;
@@ -1507,6 +1521,8 @@ bool Executor::CarveRowScratch(
   s.xn = f32(T * hc_dim);
   s.xn_half = static_cast<__half*>(bytes(T * hc_dim * sizeof(__half)));
   s.res16 = static_cast<std::uint16_t*>(bytes(T * hc_dim * sizeof(std::uint16_t)));
+  s.xn16 = static_cast<std::uint16_t*>(bytes(T * hc_dim * sizeof(std::uint16_t)));
+  s.hgn_w = f32(T * 4);
   s.xn_q8t = bytes(Q8TiledBytes(T, hc_dim));
   s.lo = f32(T * c.hc_low_rank);
   s.mixed = f32(T * hidden);
@@ -2923,7 +2939,7 @@ void Executor::SyncRes() const {
 void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                        const float* inject_w, const DeviceMixer* next) const {
   const Config& c = config();
-  const bool use16 = HcBf16() && res16_n_ != 0 && res16_n_ == n_tokens && res == s_.res;
+  const bool use16 = (hgn_model_ && HcBf16()) && res16_n_ != 0 && res16_n_ == n_tokens && res == s_.res;
   Emu(1, res, std::size_t{n_tokens} * c.HcDim(), false, stream_);
   if (!moe_pending_) Emu(32, s_.block_out, std::size_t{n_tokens} * c.hidden_size, false, stream_);
   struct XnEmu {
@@ -2987,7 +3003,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     // 4,096 tokens) instead of this combine writing the residual and the
     // next reading it back (168 MB each).
     const bool defer_now = defer && c.hc_count == 4;
-    if (HcBf16() && !defer_now && c.hc_count == 4 &&
+    if ((hgn_model_ && HcBf16()) && !defer_now && c.hc_count == 4 &&
         HcCombineHgn(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half,
                      n_tokens, c.hidden_size, c.rms_eps, stream_,
                      use16 ? s_.res16 : nullptr, res16_live_)) {
@@ -3005,6 +3021,19 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
       inject_fused_ = fused_inject;
     return;
   }
+  // halogen decode boundary: residual update with the stream weights of the
+  // mixer before this sub-layer, norm into s_.xn16 (spec 4.6.1 phase 1).
+  if (hgn_w_ready_) {
+    hgn_w_ready_ = false;
+    if (!xn_half_ && (hgn_model_ && HgnDecodeOn(n_tokens)) && res == s_.res && !moe_pending_ && !deferred &&
+        c.hc_count == 4 &&
+        HcCombineHgnDecode(res, s_.block_out, s_.hgn_w, gamma, s_.xn16, n_tokens, c.hidden_size,
+                           c.rms_eps, stream_)) {
+      hgn_xn16_ready_ = gamma != nullptr;
+      return;
+    }
+  }
+  hgn_xn16_ready_ = false;
   // A decode batch's next mixer quantizes xn for its down projection: the
   // combine writes those rows as well, or joins that mixer's single launch.
   if (next != nullptr && gamma != nullptr && FusedMixer(*next, n_tokens)) {
@@ -3030,6 +3059,40 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      std::string* error_msg, bool half_only,
                      bool no_f32) const {
   const Config& c = config();
+  // halogen decode boundary (spec 4.6.1 phases 2 and 3) for small batches
+  // with q6g64 mixers.
+  if ((hgn_model_ && HgnDecodeOn(n_tokens)) && !(normed && xn_half_) && pending_combine_.mixer == nullptr &&
+      c.hc_count == 4 && c.hidden_size == 2560 && c.hc_low_rank == 320 &&
+      m.down.type == GgmlType::kQ6G64 && m.up.type == GgmlType::kQ6G64 &&
+      m.down.rows == c.hc_low_rank && m.down.cols == c.HcDim() && m.up.rows == c.HcDim() &&
+      m.up.cols == c.hc_low_rank &&
+      (m.inject.empty() || (m.inject.type == GgmlType::kQ6G64 && m.inject.rows == 4))) {
+    if (!(normed && hgn_xn16_ready_) &&
+        !HcCombineHgnDecode(const_cast<float*>(res), nullptr, nullptr, m.norm.f32(), s_.xn16,
+                            n_tokens, c.hidden_size, c.rms_eps, stream_)) {
+      AssignError(error_msg, "halogen decode norm refused");
+      return false;
+    }
+    hgn_xn16_ready_ = false;
+    const bool w_rows = inject != nullptr && !m.inject.empty();
+    if (!HgnDecodeDown(m.down.data, w_rows ? m.inject.data : nullptr, s_.xn16, s_.lo, s_.hgn_w,
+                       n_tokens, c.hc_low_rank, w_rows ? 4u : 0u, c.HcDim(),
+                       1.0F / static_cast<float>(c.hc_count), stream_) ||
+        !HgnDecodeUpMix(m.up.data, s_.lo, s_.xn16, mixed, nullptr, n_tokens, c.hidden_size,
+                        c.hc_low_rank, stream_)) {
+      AssignError(error_msg, "halogen decode mixer refused");
+      return false;
+    }
+    hgn_w_ready_ = w_rows;
+    xn_half_ = false;
+    xn_q8_ready_ = {};
+    q8t_src_ = nullptr;
+    half_src_ = nullptr;
+    mixed_q8_ready_ = {};
+    inject_fused_ = nullptr;
+    inject_parts_ = 1;
+    return true;
+  }
   mixed_q8_ready_ = {};  // `mixed` is rewritten below
   if (pending_combine_.mixer != nullptr) {
     const PendingCombine p = pending_combine_;
@@ -3130,12 +3193,12 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         return false;
       }
     } else {
-      if (HcBf16() && xn_half_)
+      if ((hgn_model_ && HcBf16()) && xn_half_)
         SiluScaleHgn(s_.lo, scale, static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
       else
         SiluScale(s_.lo, scale,
                   static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
-      if (HcBf16() && xn_half_ && m.up.type == GgmlType::kQ6G64 &&
+      if ((hgn_model_ && HcBf16()) && xn_half_ && m.up.type == GgmlType::kQ6G64 &&
           WidePrefill(n_tokens) && WideHgn(m.up, n_tokens)) {
         wide_out16_ = reinterpret_cast<std::uint16_t*>(s_.hc_gate);
         gate16 = true;
@@ -3196,7 +3259,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                            fused_inject ? m.inject.f32() : nullptr, mixed,
                            extras ? static_cast<__half*>(s_.x_half) : nullptr,
                            extras && !wide_mixer_q6_ ? s_.x_q8t : nullptr, inject, n_tokens,
-                           c.hidden_size, stream_, HcBf16(), gate16);
+                           c.hidden_size, stream_, (hgn_model_ && HcBf16()), gate16);
     }
     if (extras) {
       half_src_ = mixed;
@@ -4206,8 +4269,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     dn.per_slot_out = rot_per_slot_for_test_ ? 1 : 0;
     dn.plain_f16 = rot_plain_f16_ ? 1 : 0;
     dn.hgn_bf16 = 0;
+    dn.hgn_decode = !grouped && (hgn_model_ && HgnDecodeOn(n_tokens)) ? 1 : 0;
     if (grouped) {
-      dn.hgn_bf16 = HcBf16() ? 1 : 0;
+      dn.hgn_bf16 = (hgn_model_ && HcBf16()) ? 1 : 0;
       dn.group_offsets = rot_group_offsets_;
       dn.group_slots = rot_group_slots_;
       dn.group_items = rot_group_items_;
@@ -4872,7 +4936,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     pass_rows.tokens[pass_rows.count++] = checkpoint->tokens;
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
   res16_live_ = false;
-  res16_n_ = HcBf16() && WidePrefill(n) && n <= options_.max_batch ? n : 0;
+  res16_n_ = (hgn_model_ && HcBf16()) && WidePrefill(n) && n <= options_.max_batch ? n : 0;
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!session.CheckCancellation(error_msg))
       return false;

@@ -820,7 +820,7 @@ private:
   /// The host-side dispatch state a pass advances. A pass that is executed
   /// and then recorded again must restore it first (Run).
   [[nodiscard]] auto DispatchState() const {
-    return std::tie(moe_pending_, defer_residual_, res_deferred_,
+    return std::tie(moe_pending_, hgn_w_ready_, hgn_xn16_ready_, defer_residual_, res_deferred_,
                     shexp_half_ready_, q8t_src_, q8t_rows_, q8t_cols_,
                     half_src_, half_rows_, half_cols_, half_bf16_, xn_half_,
                     inject_parts_, inject_fused_, q8_slot_, xn_q8_ready_,
@@ -887,7 +887,9 @@ private:
     float* res;
     float* xn;
     __half* xn_half;  ///< xn as F16 on the F16 mixer input route
-    std::uint16_t* res16;  ///< bf16 residual of the wide prompt pass
+    std::uint16_t* res16;
+    std::uint16_t* xn16;  ///< decode boundary: normalised streams, bf16 bits
+    float* hgn_w;         ///< decode boundary: stream weights [rows][4]  ///< bf16 residual of the wide prompt pass
     void* xn_q8t;     ///< xn as tiled Q8 for the W8A8 mixer down projection
     float* lo;
     float* hc_gate;
@@ -1173,6 +1175,12 @@ private:
   /// the combines keep the residual in s_.res16 (bf16); res16_live_ marks
   /// s_.res stale until SyncRes copies it back.
   mutable bool res16_live_{false};
+  /// halogen decode boundary state: s_.hgn_w holds the last mixer's stream
+  /// weights; s_.xn16 holds the last combine's normalised streams.
+  /// The weights are halogen-format (see Create): gates the halogen paths.
+  bool hgn_model_{false};
+  mutable bool hgn_w_ready_{false};
+  mutable bool hgn_xn16_ready_{false};
   /// When set, the next wide decoded-weight GEMM writes bf16
   /// bit patterns here instead of f32 (the up multiply under GUFO_HC_BF16).
   mutable std::uint16_t* wide_out16_{nullptr};

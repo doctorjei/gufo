@@ -7350,7 +7350,8 @@ template<bool kIn16, bool kOut16>
 __global__ __launch_bounds__(256) void HcCombineHgnKernel(
     float* res, std::uint16_t* res16, const float* block_out, const float* inject,
     std::uint32_t inject_parts, const float* gamma, __half* xn,
-    std::uint32_t hidden, float eps) {
+    std::uint32_t hidden, float eps, const float* w_pre = nullptr,
+    std::uint16_t* xn16 = nullptr) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxQ = 10;
   __shared__ float part[256];
@@ -7364,11 +7365,16 @@ __global__ __launch_bounds__(256) void HcCombineHgnKernel(
   for (std::uint32_t s = 0; s < kStreams; ++s) {
     // Per-stream weight: the down multiply's bf16 logit, x = logit / 4,
     // 2 * sigmoid(x) (spec 4.4.1 points 1 to 3).
-    float logit = 0.0f;
-    for (std::uint32_t p = 0; p < inject_parts; ++p)
-      logit = __fadd_rn(logit, inject[(static_cast<std::size_t>(t) * kStreams + s) * inject_parts + p]);
-    const float x = HgnBf16(logit) * 0.25f;
-    const float w = 2.0f * __fdiv_rn(1.0f, HgnSigmoidDen(x));
+    float w = 0.0f;
+    if (w_pre != nullptr) {
+      w = w_pre[static_cast<std::size_t>(t) * kStreams + s];  // spec 4.6.1 phase 2 point 7
+    } else if (src != nullptr) {
+      float logit = 0.0f;
+      for (std::uint32_t p = 0; p < inject_parts; ++p)
+        logit = __fadd_rn(logit, inject[(static_cast<std::size_t>(t) * kStreams + s) * inject_parts + p]);
+      const float x = HgnBf16(logit) * 0.25f;
+      w = 2.0f * __fdiv_rn(1.0f, HgnSigmoidDen(x));
+    }
     float v[kMaxQ];
     float ss = 0.0f;
 #pragma unroll
@@ -7376,14 +7382,18 @@ __global__ __launch_bounds__(256) void HcCombineHgnKernel(
       if (q >= nq) break;
       const std::uint32_t i = tid + 256 * q;
       const std::size_t e = static_cast<std::size_t>(s) * hidden + i;
-      const float y = HgnBf16(src[i]);
       const float r = kIn16 ? __uint_as_float(static_cast<std::uint32_t>(dst16[e]) << 16)
                             : HgnBf16(dst[e]);
-      v[q] = HgnBf16(__fmaf_rn(w, y, r));
-      if constexpr (kOut16)
-        dst16[e] = static_cast<std::uint16_t>(__float_as_uint(v[q]) >> 16);
-      else
-        dst[e] = v[q];
+      if (src == nullptr) {
+        v[q] = r;  // norm only (first layer, after PLE, head)
+      } else {
+        const float y = HgnBf16(src[i]);
+        v[q] = HgnBf16(__fmaf_rn(w, y, r));
+        if constexpr (kOut16)
+          dst16[e] = static_cast<std::uint16_t>(__float_as_uint(v[q]) >> 16);
+        else
+          dst[e] = v[q];
+      }
       ss = __fmaf_rn(v[q], v[q], ss);
     }
     part[tid] = ss;
@@ -7403,7 +7413,10 @@ __global__ __launch_bounds__(256) void HcCombineHgnKernel(
       const std::uint32_t i = tid + 256 * q;
       const std::size_t e = static_cast<std::size_t>(s) * hidden + i;
       const float o = HgnBf16(__fmul_rn(__fmul_rn(v[q], rs), gamma[e]));
-      xn[static_cast<std::size_t>(t) * hc_dim + e] = __float2half_rn(o);
+      if (xn16 != nullptr)
+        xn16[static_cast<std::size_t>(t) * hc_dim + e] = static_cast<std::uint16_t>(__float_as_uint(o) >> 16);
+      else
+        xn[static_cast<std::size_t>(t) * hc_dim + e] = __float2half_rn(o);
     }
   }
 }
@@ -7417,7 +7430,168 @@ bool HcCombineHgn(float* res, const float* block_out, const float* inject,
                       : from16         ? HcCombineHgnKernel<true, true>
                                        : HcCombineHgnKernel<false, true>;
   hipLaunchKernelGGL(kernel, dim3(n_tokens), dim3(256), 0, stream, res, res16,
-                     block_out, inject, inject_parts, gamma, xn, hidden, eps);
+                     block_out, inject, inject_parts, gamma, xn, hidden, eps,
+                     static_cast<const float*>(nullptr), static_cast<std::uint16_t*>(nullptr));
+  return true;
+}
+
+bool HcCombineHgnDecode(float* res, const float* block_out, const float* w_pre,
+                        const float* gamma, std::uint16_t* xn16, std::uint32_t n_tokens,
+                        std::uint32_t hidden, float eps, hipStream_t stream) {
+  if (hidden % 256 != 0 || hidden > 2560) return false;
+  hipLaunchKernelGGL((HcCombineHgnKernel<false, false>), dim3(n_tokens), dim3(256), 0, stream, res,
+                     nullptr, block_out, nullptr, 0u, gamma, nullptr, hidden, eps, w_pre, xn16);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// halogen decode boundary (follow-up spec 4.6.1): residual update and norm
+// (HcCombineHgnKernel with bf16 output), then the hyper-connection down
+// multiply with its activation, then the up multiply with the mixing. q6g64
+// weights are decoded to bf16 (one FMA, then bf16) and multiplied with the
+// hardware's two-product bf16 dot step, in chunks of 32 inputs grouped as the
+// spec states.
+// ---------------------------------------------------------------------------
+typedef __bf16 HgnBf16x2 __attribute__((ext_vector_type(2)));
+
+/// bf16 bit pattern of weight k of a q6g64 row (STORAGE.md layout).
+__device__ __forceinline__ std::uint32_t HgnQ6Weight(const std::uint8_t* row, std::uint32_t K,
+                                                    std::uint32_t k) {
+  const std::uint32_t lo = (row[k >> 1] >> ((k & 1u) * 4u)) & 0xFu;
+  const std::uint32_t hi = (row[K / 2 + (k >> 2)] >> ((k & 3u) * 2u)) & 0x3u;
+  const std::uint32_t code = lo | (hi << 4);
+  const auto* rec = reinterpret_cast<const __half*>(row + K / 2 + K / 4) + (k / 64) * 2;
+  const float v = __fmaf_rn(static_cast<float>(code), __half2float(rec[0]), __half2float(rec[1]));
+  return __float_as_uint(HgnBf16(v)) >> 16;
+}
+
+/// One 32-input chunk: from zero, 16 two-product bf16 dot steps in order.
+__device__ __forceinline__ float HgnChunk(const std::uint8_t* row, std::uint32_t K,
+                                          std::uint32_t k0, const std::uint16_t* x) {
+  float acc = 0.0f;
+#pragma unroll
+  for (std::uint32_t p = 0; p < 16; ++p) {
+    const std::uint32_t k = k0 + 2 * p;
+    const std::uint32_t wv = HgnQ6Weight(row, K, k) | (HgnQ6Weight(row, K, k + 1) << 16);
+    const std::uint32_t xv = static_cast<std::uint32_t>(x[k]) | (static_cast<std::uint32_t>(x[k + 1]) << 16);
+    acc = __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(HgnBf16x2, wv),
+                                          __builtin_bit_cast(HgnBf16x2, xv), acc, false);
+  }
+  return acc;
+}
+
+__device__ __forceinline__ float HgnWaveHalve32(float v) {
+#pragma unroll
+  for (int h = 16; h > 0; h >>= 1) v = __fadd_rn(v, __shfl_down(v, h, 32));
+  return v;
+}
+
+/// Down multiply and activation (spec 4.6.1 phase 2). grid (rows / 4 + w_rows, n),
+/// 256 threads. Blocks below act_blocks: four activation rows, wave w takes
+/// row 4b + w / 2, half w % 2. The rest: one weight row each, wave w takes
+/// segment w of 8. xn: [n][K] bf16 bits; lo: [n][act_rows] bf16 bits out
+/// (as f32 values); w_out: [n][w_rows] 32-bit.
+__global__ __launch_bounds__(256) void HgnDecodeDownKernel(
+    const std::uint8_t* down, const std::uint8_t* inject, const std::uint16_t* xn,
+    float* lo, float* w_out, std::uint32_t act_rows, std::uint32_t w_rows, std::uint32_t K,
+    float c) {
+  __shared__ float part[8];
+  const std::uint32_t t = blockIdx.y;
+  const std::uint32_t wave = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+  const std::uint16_t* x = xn + static_cast<std::size_t>(t) * K;
+  const std::size_t row_bytes = (13u * K / 16u + 15u) / 16u * 16u;
+  const std::uint32_t act_blocks = act_rows / 4;
+  if (blockIdx.x < act_blocks) {
+    const std::uint32_t r = blockIdx.x * 4 + wave / 2, half = wave & 1u;
+    const std::uint8_t* row = down + r * row_bytes;
+    const std::uint32_t chunks = K / 2 / 32, base = half * (K / 2);
+    float p = 0.0f;
+    for (std::uint32_t k = lane; k < chunks; k += 32) p = __fadd_rn(p, HgnChunk(row, K, base + k * 32, x));
+    p = HgnWaveHalve32(p);
+    if (lane == 0) part[wave] = p;
+    __syncthreads();
+    if (threadIdx.x < 4) {
+      const std::uint32_t rr = blockIdx.x * 4 + threadIdx.x;
+      const float total = __fadd_rn(__fadd_rn(0.0f, part[2 * threadIdx.x]), part[2 * threadIdx.x + 1]);
+      const float a = __fmul_rn(HgnBf16(total), c);
+      lo[static_cast<std::size_t>(t) * act_rows + rr] = HgnBf16(__fdiv_rn(a, HgnSigmoidDen(a)));
+    }
+    return;
+  }
+  const std::uint32_t r = blockIdx.x - act_blocks;
+  if (r >= w_rows) return;
+  const std::uint8_t* row = inject + r * row_bytes;
+  const std::uint32_t seg = K / 8, chunks = seg / 32, base = wave * seg;
+  float p = 0.0f;
+  for (std::uint32_t k = lane; k < chunks; k += 32) p = __fadd_rn(p, HgnChunk(row, K, base + k * 32, x));
+  p = HgnWaveHalve32(p);
+  if (lane == 0) part[wave] = p;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    for (int s = 0; s < 8; ++s) total = __fadd_rn(total, part[s]);
+    const float a = __fmul_rn(HgnBf16(total), c);
+    w_out[static_cast<std::size_t>(t) * w_rows + r] = 2.0f * __fdiv_rn(1.0f, HgnSigmoidDen(a));
+  }
+}
+
+/// Up multiply and mixing (spec 4.6.1 phase 3). grid (hidden / 4, n), 256
+/// threads: half-wave (16 lanes) per row, 16 rows = 4 positions x 4 streams.
+/// lo: [n][R] activated values (bf16 values in f32); xn: [n][4 * hidden] bf16
+/// bits; mixed: [n][hidden] (bf16 values in f32), mixed_half optional.
+__global__ __launch_bounds__(256) void HgnDecodeUpMixKernel(
+    const std::uint8_t* up, const float* lo, const std::uint16_t* xn, float* mixed,
+    __half* mixed_half, std::uint32_t hidden, std::uint32_t R) {
+  __shared__ float a_s[4][4];
+  const std::uint32_t t = blockIdx.y;
+  const std::uint32_t hl = threadIdx.x >> 4;  // 0..15: row within the block
+  const std::uint32_t l16 = threadIdx.x & 15u;
+  const std::uint32_t pos = blockIdx.x * 4 + (hl >> 2), s = hl & 3u;
+  const std::uint32_t row_i = s * hidden + pos;
+  const std::size_t row_bytes = (13u * R / 16u + 15u) / 16u * 16u;
+  const std::uint8_t* row = up + row_i * row_bytes;
+  __shared__ std::uint16_t lo16[1024];
+  for (std::uint32_t i = threadIdx.x; i < R; i += 256)
+    lo16[i] = static_cast<std::uint16_t>(__float_as_uint(lo[static_cast<std::size_t>(t) * R + i]) >> 16);
+  __syncthreads();
+  const std::uint32_t n_chunks = R / 32;  // 10
+  float v = l16 < n_chunks ? HgnChunk(row, R, l16 * 32, lo16) : 0.0f;
+#pragma unroll
+  for (int h = 8; h > 0; h >>= 1) v = __fadd_rn(v, __shfl_down(v, h, 16));
+  if (l16 == 0) a_s[hl >> 2][s] = HgnBf16(v);
+  __syncthreads();
+  if (threadIdx.x < 4) {
+    const std::uint32_t p = blockIdx.x * 4 + threadIdx.x;
+    float acc = 0.0f;
+    for (std::uint32_t ss = 0; ss < 4; ++ss) {
+      const float g = HgnBf16(__fdiv_rn(1.0f, HgnSigmoidDen(a_s[threadIdx.x][ss])));
+      const float n = __uint_as_float(static_cast<std::uint32_t>(
+                                          xn[static_cast<std::size_t>(t) * 4 * hidden + ss * hidden + p])
+                                      << 16);
+      acc = __fmaf_rn(n, g, acc);
+    }
+    const float m = HgnBf16(acc * 0.25f);
+    mixed[static_cast<std::size_t>(t) * hidden + p] = m;
+    if (mixed_half != nullptr) mixed_half[static_cast<std::size_t>(t) * hidden + p] = __float2half_rn(m);
+  }
+}
+
+bool HgnDecodeDown(const void* down, const void* inject, const std::uint16_t* xn, float* lo,
+                   float* w_out, std::uint32_t n, std::uint32_t act_rows, std::uint32_t w_rows,
+                   std::uint32_t K, float c, hipStream_t stream) {
+  if (act_rows % 4 != 0 || K % 512 != 0 || (w_rows != 0 && inject == nullptr)) return false;
+  hipLaunchKernelGGL(HgnDecodeDownKernel, dim3(act_rows / 4 + w_rows, n), dim3(256), 0, stream,
+                     static_cast<const std::uint8_t*>(down), static_cast<const std::uint8_t*>(inject),
+                     xn, lo, w_out, act_rows, w_rows, K, c);
+  return true;
+}
+
+bool HgnDecodeUpMix(const void* up, const float* lo, const std::uint16_t* xn, float* mixed,
+                    __half* mixed_half, std::uint32_t n, std::uint32_t hidden, std::uint32_t R,
+                    hipStream_t stream) {
+  if (hidden % 4 != 0 || R % 32 != 0 || R / 32 > 16 || R > 1024) return false;
+  hipLaunchKernelGGL(HgnDecodeUpMixKernel, dim3(hidden / 4, n), dim3(256), 0, stream,
+                     static_cast<const std::uint8_t*>(up), lo, xn, mixed, mixed_half, hidden, R);
   return true;
 }
 

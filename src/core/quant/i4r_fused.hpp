@@ -97,6 +97,9 @@ struct I4rDownArgs {
   /// (follow-up spec 4.4.4): bf16 slot outputs, separate multiply then add,
   /// bf16 after the rotation and again after the shared expert.
   int hgn_bf16;
+  /// halogen's decode combine (follow-up spec 4.6.4): as hgn_bf16 but the
+  /// slot outputs stay 32-bit.
+  int hgn_decode;
 };
 
 /// Launches gate+up for n_slots = n_tokens * used slots. False when the

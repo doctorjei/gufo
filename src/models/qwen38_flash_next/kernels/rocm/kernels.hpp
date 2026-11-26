@@ -197,6 +197,21 @@ bool HcCombineHgn(float* res, const float* block_out, const float* inject,
                   std::uint32_t n_tokens, std::uint32_t hidden, float eps,
                   hipStream_t stream, std::uint16_t* res16 = nullptr,
                   bool from16 = false);
+/// halogen decode boundary (follow-up spec 4.6.1), for small batches:
+/// residual update with the stream weights w_pre ([n][4], from the previous
+/// down multiply's weight rows; block_out null: norm of res only), norm to
+/// bf16 bits in xn16 ([n][4 hidden]); the down multiply with its activation
+/// (lo: [n][act_rows], bf16 values) and weight rows (w_out: [n][w_rows]);
+/// the up multiply with the mixing into mixed ([n][hidden], bf16 values).
+bool HcCombineHgnDecode(float* res, const float* block_out, const float* w_pre,
+                        const float* gamma, std::uint16_t* xn16, std::uint32_t n_tokens,
+                        std::uint32_t hidden, float eps, hipStream_t stream);
+bool HgnDecodeDown(const void* down, const void* inject, const std::uint16_t* xn, float* lo,
+                   float* w_out, std::uint32_t n, std::uint32_t act_rows, std::uint32_t w_rows,
+                   std::uint32_t K, float c, hipStream_t stream);
+bool HgnDecodeUpMix(const void* up, const float* lo, const std::uint16_t* xn, float* mixed,
+                    __half* mixed_half, std::uint32_t n, std::uint32_t hidden, std::uint32_t R,
+                    hipStream_t stream);
 /// bf16 bit patterns to f32 (exact).
 void Bf16ToF32(const std::uint16_t* in, float* out, std::size_t n, hipStream_t stream);
 /// SiluScale over `rows` rows of `k` that also writes x's Q8_1 rows, each
