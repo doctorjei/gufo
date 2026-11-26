@@ -270,6 +270,8 @@ public:
   /// covering its positions past it, up to the configured one; its cached
   /// keys are re-rotated when the factor changes.
   [[nodiscard]] bool DynamicYarn() const noexcept { return dynamic_yarn_; }
+  /// Halogen-format weights (rotated experts, q6g64 mixers).
+  [[nodiscard]] bool hgn_model() const noexcept { return hgn_model_; }
   [[nodiscard]] float YarnLevelFor(std::size_t end_position) const noexcept;
   [[nodiscard]] float YarnFactor(const Session& s) const noexcept {
     return s.yarn_factor_;

@@ -64,6 +64,11 @@ int main() {
   hipEvent_t e0, e1;
   HIP_OK(hipEventCreate(&e0));
   HIP_OK(hipEventCreate(&e1));
+  const bool cold = std::getenv("PGB_COLD") != nullptr && std::getenv("PGB_COLD")[0] == '1';
+  void* flush = nullptr;
+  const std::size_t flush_bytes = 256u << 20;
+  HIP_OK(hipMalloc(&flush, flush_bytes));
+  std::printf("mode: %s\n", cold ? "cold (256 MiB written before each call)" : "warm (back to back)");
   void* ws = nullptr;
   const std::size_t ws_bytes = 64u << 20;
   HIP_OK(hipMalloc(&ws, ws_bytes));
@@ -82,6 +87,22 @@ int main() {
     HIP_OK(hipMemcpy(dx, x.data(), x.size() * 2, hipMemcpyHostToDevice));
     const auto time = [&](auto&& fn) {
       for (int i = 0; i < 3; ++i) fn();
+      if (cold) {
+        // PGB_COLD=1: each call timed alone after writing a buffer larger than
+        // the last-level cache, so weights and inputs start from memory.
+        float sum = 0;
+        for (int i = 0; i < 10; ++i) {
+          HIP_OK(hipMemsetAsync(flush, i & 0xFF, flush_bytes, nullptr));
+          HIP_OK(hipEventRecord(e0, nullptr));
+          fn();
+          HIP_OK(hipEventRecord(e1, nullptr));
+          HIP_OK(hipEventSynchronize(e1));
+          float ms = 0;
+          HIP_OK(hipEventElapsedTime(&ms, e0, e1));
+          sum += ms;
+        }
+        return sum / 10;
+      }
       HIP_OK(hipEventRecord(e0, nullptr));
       for (int i = 0; i < 10; ++i) fn();
       HIP_OK(hipEventRecord(e1, nullptr));

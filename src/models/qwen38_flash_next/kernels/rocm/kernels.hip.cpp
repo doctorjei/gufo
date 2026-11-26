@@ -1933,7 +1933,8 @@ __device__ __forceinline__ void GdnEpilogueRow(
     const float (&v)[kGdnDim / 32], const float (&zv)[kGdnDim / 32],
     const float (&nw)[kGdnDim / 32], std::size_t row, std::uint32_t lane,
     std::uint32_t v_heads, float eps, float* out, void* out_q8,
-    __half* out_half, void* out_q8_1, std::uint32_t out_half_stride) {
+    __half* out_half, void* out_q8_1, std::uint32_t out_half_stride,
+    std::size_t half_offset = ~std::size_t{0}) {
   constexpr std::uint32_t d = kGdnDim;
   const std::uint32_t per_lane = d / warpSize;
   float ss = v[0] * v[0];
@@ -1953,8 +1954,11 @@ __device__ __forceinline__ void GdnEpilogueRow(
       const std::uint32_t i = r * warpSize + lane;
       const float value = normed(r);
       if (out_half != nullptr) {
+        // half_offset: the row's first half, when the caller knows it
+        // (saves a 64-bit division by v_heads per row).
         const auto offset =
-            out_half_stride != 0
+            half_offset != ~std::size_t{0} ? half_offset
+            : out_half_stride != 0
                 ? (row / v_heads) * out_half_stride + (row % v_heads) * d
                 : row * d;
         out_half[offset + i] = __float2half_rn(value);
@@ -2453,7 +2457,19 @@ __device__ __forceinline__ float SsmConv4Value(float4 w, float x0, float x1,
   return SiluF(acc);
 }
 
-template<bool kSaveHistory, bool kBatch>
+/// Halogen's form of the same convolution (spec 5.8.4): bf16 inputs, the
+/// oldest tap's product first, then fused multiply-adds, SiLU with a
+/// correctly rounded division, one bf16 rounding (the value stays 32-bit).
+__device__ __forceinline__ float SsmConv4HgnValue(float4 w, float x0, float x1,
+                                                  float x2, float x3) {
+  float acc = __fmul_rn(w.x, HgnBf16(x0));
+  acc = __fmaf_rn(w.y, HgnBf16(x1), acc);
+  acc = __fmaf_rn(w.z, HgnBf16(x2), acc);
+  acc = __fmaf_rn(w.w, HgnBf16(x3), acc);
+  return HgnBf16(__fdiv_rn(acc, HgnSigmoidDen(acc)));
+}
+
+template<bool kSaveHistory, bool kBatch, bool kHgn = false>
 __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
                                const float* w, float* conv_state, float* out,
                                std::uint32_t n_tokens, std::uint32_t channels,
@@ -2496,7 +2512,8 @@ __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
     }
     const float v = qkv[static_cast<std::size_t>(t) * qkv_stride + c];
     out[static_cast<std::size_t>(t) * channels + c] =
-        SsmConv4Value(taps, window[0], window[1], window[2], v);
+        kHgn ? SsmConv4HgnValue(taps, window[0], window[1], window[2], v)
+             : SsmConv4Value(taps, window[0], window[1], window[2], v);
     window[0] = window[1];
     window[1] = window[2];
     window[2] = v;
@@ -9358,10 +9375,13 @@ __launch_bounds__(256) __attribute__((amdgpu_num_vgpr(192))) __global__ void Gdn
         v[rr] = GdnBf16Value(s_o[i][rr * 32 + lane]);
         zv[rr] = HgnBf16(zr[rr * 32 + lane]);
       }
+      const std::size_t half_offset =
+          out_half_stride != 0 ? static_cast<std::size_t>(t) * out_half_stride + static_cast<std::size_t>(h) * d
+                               : (static_cast<std::size_t>(t) * v_heads + h) * d;
       GdnEpilogueRow(v, zv, nw, static_cast<std::size_t>(t) * v_heads + h, lane, v_heads, eps,
                      out, kOutput == GdnOutput::kQ8 ? out_q8 : nullptr,
                      kOutput == GdnOutput::kHalf ? out_half : nullptr,
-                     kOutput == GdnOutput::kF32Q8_1 ? out_q8_1 : nullptr, out_half_stride);
+                     kOutput == GdnOutput::kF32Q8_1 ? out_q8_1 : nullptr, out_half_stride, half_offset);
     }
   };
 
@@ -9609,6 +9629,12 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   const bool saved_history = !convolved && kernel == kSsmConvTaps &&
                              n_tokens <= kSsmConvTokensPerThread;
+  // The chunked form saves state only at chunk ends: a checkpoint elsewhere
+  // keeps the token kernel for this pass. Its passes also take halogen's
+  // convolution form.
+  bool chunk_ok = chunked && row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr;
+  for (std::uint32_t i = 0; i < checkpoint.count; ++i)
+    chunk_ok = chunk_ok && (checkpoint.tokens[i] % kGdnChunk == 0 || checkpoint.tokens[i] == n_tokens);
   for (std::uint32_t i = 0; i < checkpoint.count; ++i)
     if (checkpoint.history[i] != nullptr)
       HistoryPrefix(qkv, qkv_stride, conv_state, checkpoint.history[i],
@@ -9620,12 +9646,16 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                          conv_state, conv_scratch, n_tokens, channels,
                          conv_snapshots, nullptr, 0);
     } else if (kernel == kSsmConvTaps) {
-      hipLaunchKernelGGL(
-          (SsmConv4Kernel<false, false>),
-          dim3(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
-                                     kSsmConvTokensPerThread),
-          dim3(kThreads), 0, stream, qkv, qkv_stride, conv_w, conv_state,
-          conv_scratch, n_tokens, channels, RollbackRows{}, nullptr, 0);
+      const dim3 grid(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
+                                            kSsmConvTokensPerThread);
+      if (chunk_ok)
+        hipLaunchKernelGGL((SsmConv4Kernel<false, false, true>), grid, dim3(kThreads), 0,
+                           stream, qkv, qkv_stride, conv_w, conv_state, conv_scratch,
+                           n_tokens, channels, RollbackRows{}, nullptr, 0);
+      else
+        hipLaunchKernelGGL((SsmConv4Kernel<false, false>), grid, dim3(kThreads), 0,
+                           stream, qkv, qkv_stride, conv_w, conv_state, conv_scratch,
+                           n_tokens, channels, RollbackRows{}, nullptr, 0);
     } else {
       hipLaunchKernelGGL(SsmConvKernel, dim3(Blocks(count)), dim3(kThreads), 0,
                          stream, qkv, qkv_stride, conv_w, conv_state,
@@ -9658,11 +9688,6 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
     if (z_ready != nullptr &&
         hipStreamWaitEvent(stream, z_ready, 0) != hipSuccess)
       return false;
-    // The chunked form saves state only at chunk ends: a checkpoint elsewhere
-    // keeps the token kernel for this pass.
-    bool chunk_ok = chunked;
-    for (std::uint32_t i = 0; i < checkpoint.count; ++i)
-      chunk_ok = chunk_ok && (checkpoint.tokens[i] % kGdnChunk == 0 || checkpoint.tokens[i] == n_tokens);
     const auto launch = [&](auto kernel) {
       hipLaunchKernelGGL(kernel, dim3(v_heads), dim3(kGdnPrefillWaves * 32), 0,
                          stream, conv_scratch, alpha_beta, a, dt, z, z_stride,

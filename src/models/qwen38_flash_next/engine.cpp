@@ -1,5 +1,6 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
 
+#include <numeric>
 #include <cstdlib>
 #include <algorithm>
 #include <array>
@@ -338,6 +339,11 @@ void Model::ReleaseWidePasses() const {
 
 bool Model::HasMtp() const noexcept {
   return device_->has_mtp();
+}
+
+std::size_t Model::PrefillAlignment() const noexcept {
+  const std::size_t ratio = std::max<std::uint32_t>(1, config().compress_ratio);
+  return ratio;
 }
 
 std::size_t Model::ExpandedQ8_0Tensors() const noexcept {
@@ -1109,6 +1115,8 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
 
 struct Session::PendingDecode {
   std::vector<std::int32_t> chain;
+  /// Each MTP draft's own probability (GUFO_DRAFT_DIAG).
+  std::vector<float> confs;
   std::vector<MtpProposal> proposals;
   std::uint32_t base{0};
   bool speculative{false};
@@ -1153,6 +1161,7 @@ void Session::AppendDraft(PendingDecode& pending) {
     pending.draft = static_cast<std::int32_t>(pending.proposals.back().token);
     pending.draft_sampler->Accept(pending.proposals.back().token);
   }
+  pending.confs.push_back(pending.draft_confidence);
   pending.chain.push_back(pending.draft);
 }
 
@@ -1567,6 +1576,26 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
   stats_.small_head_cycles += pending.draft_subset;
+  // DIAGNOSTIC: GUFO_DRAFT_DIAG=1 logs each verified round (drafted chain,
+  // kept length, copied proposals, small-head use, each draft's probability).
+  static const bool diag = [] {
+    const char* v = std::getenv("GUFO_DRAFT_DIAG");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (diag) {
+    std::string line = "draftdiag k=" + std::to_string(k) + " keep=" + std::to_string(keep) +
+                       " lookup=" + std::to_string(pending.lookup) +
+                       " subset=" + std::to_string(pending.draft_subset ? 1 : 0) + " chain=";
+    for (std::size_t i = 0; i < chain.size() && i < k; ++i)
+      line += (i ? "," : "") + std::to_string(chain[i]);
+    line += " confs=";
+    for (std::size_t i = 0; i < pending.confs.size(); ++i) {
+      char buf[16];
+      std::snprintf(buf, sizeof buf, "%s%.3f", i ? "," : "", pending.confs[i]);
+      line += buf;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+  }
   // Copied proposals trail the MTP drafts. After a fully accepted MTP part,
   // the length controller also counts the accepted copied tokens as accepted
   // drafts: a copy that ended drafting early would otherwise make a perfect

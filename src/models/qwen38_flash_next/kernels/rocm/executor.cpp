@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -3620,7 +3621,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                      c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
                      c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
                      convolved, c.rms_eps, stream_, out_half, checkpoint,
-                     half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready)) {
+                     half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready,
+                     /*chunked=*/hgn_model_)) {
     AssignError(error_msg, "DeltaNet launch failed");
     return false;
   }

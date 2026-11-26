@@ -95,7 +95,7 @@ struct Result {
 // given conv and recurrent states (updated in place).
 void Pass(const Inputs& in, std::uint32_t first, std::uint32_t count, bool chunked, Buf& d_conv_state,
           Buf& d_state, std::vector<float>* out, q::GdnCheckpoint cp = {}, int reps = 1,
-          float* ms = nullptr, const std::vector<float>* conv_rows = nullptr) {
+          float* ms = nullptr, const std::vector<float>* conv_rows = nullptr, bool half_out = false) {
   Buf d_qkv(static_cast<std::size_t>(count) * kChannels), d_z(static_cast<std::size_t>(count) * kZ),
       d_ab(static_cast<std::size_t>(count) * 2 * kVHeads), d_cw(in.conv_w.size()), d_a(kVHeads),
       d_dt(kVHeads), d_nw(kDim), d_scratch(static_cast<std::size_t>(count + kKernel) * kChannels),
@@ -127,7 +127,8 @@ void Pass(const Inputs& in, std::uint32_t first, std::uint32_t count, bool chunk
     if (!q::GatedDeltaNet(d_qkv.p, kChannels, d_z.p, kZ, d_ab.p, d_cw.p, d_a.p, d_dt.p, d_nw.p,
                           d_conv_state.p, d_scratch.p, d_qn.p, d_kn.p, d_raw.p, d_state.p, d_out.p,
                           nullptr, {}, {}, count, kKHeads, kVHeads, kDim, kKernel, true, conv_rows != nullptr, kEps,
-                          nullptr, nullptr, cp, 0, nullptr, nullptr, chunked))
+                          nullptr, half_out ? reinterpret_cast<__half*>(d_out.p) : nullptr, cp,
+                          half_out ? kZ + 32 : 0, nullptr, nullptr, chunked))
       throw std::runtime_error("GatedDeltaNet refused");
     if (r == reps - 1) Check(hipEventRecord(e1, nullptr), "record");
   }
@@ -208,6 +209,18 @@ int main() {
     if (!(eo < 5e-2 && es < 5e-2)) {
       std::printf("FAIL: chunked recurrence disagrees with the token kernel on identical inputs at n=%u\n", n);
       ++fails;
+    }
+  }
+  // The f16-output variant with the padded row stride the prompt pass uses.
+  {
+    const Inputs in(2304);
+    Buf cs(kConvState), st(kStateCount);
+    for (const bool chunked : {false, true}) {
+      cs.up(in.conv_state);
+      st.up(in.state);
+      float ms = 0.0F;
+      Pass(in, 0, in.n, chunked, cs, st, nullptr, {}, 3, &ms, nullptr, true);
+      std::printf("f16 rows, stride %u: %s %.3f ms\n", kZ + 32, chunked ? "chunked" : "token", ms);
     }
   }
   // Split invariance on a 16-token boundary, and a checkpoint there.

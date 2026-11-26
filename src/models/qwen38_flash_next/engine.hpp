@@ -112,6 +112,9 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// Prompt passes and in-pass checkpoints start on multiples of this: the
+  /// compress ratio (sparse selection blocks).
+  [[nodiscard]] std::size_t PrefillAlignment() const noexcept;
   /// Trunk tensors the official GGUF keeps in F32 but this artifact stores
   /// as Q8_0 (see `ExpandedQ8_0Tensors`). The official MTP sidecar ships its
   /// inject as Q8_0, so the draft block is not counted.

@@ -345,8 +345,7 @@ public:
                 .partial_prefill_retention = true,
                 // Sparse prefill tiles group four queries from each pass
                 // start: one selection block (compress ratio).
-                .prefill_alignment =
-                    std::max<std::size_t>(1, model_->config().compress_ratio),
+                .prefill_alignment = model_->PrefillAlignment(),
                 .max_in_pass_checkpoints = rocm::kMaxPassCheckpoints,
             },
         .sampling_defaults = FlashNextSamplingDefaults(),
@@ -806,8 +805,7 @@ private:
                                        std::size_t remaining,
                                        std::size_t capacity) const noexcept {
     auto count = std::min({budget, remaining, capacity});
-    const std::size_t ratio =
-        std::max<std::uint32_t>(1, model_->config().compress_ratio);
+    const std::size_t ratio = model_->PrefillAlignment();
     if (const auto over = (offset + count) % ratio;
         count < remaining && count > over)
       count -= over;
