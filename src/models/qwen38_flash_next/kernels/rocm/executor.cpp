@@ -65,8 +65,11 @@ bool HcBf16() {
 // route; same switch as the bf16 prompt pass.
 bool HgnDecodeOn(std::uint32_t n_tokens) {
   static const bool on = [] {
+    // Off by default: the decode boundary is parked (not yet faster than
+    // the q6g64 matrix-vector route; see hgn-decode work). GUFO_HGN_DECODE=1
+    // enables it.
     const char* v = std::getenv("GUFO_HGN_DECODE");
-    return v == nullptr || v[0] != '0';
+    return v != nullptr && v[0] == '1';
   }();
   return on && HcBf16() && n_tokens >= 1 && n_tokens <= 64;
 }
